@@ -1,4 +1,4 @@
-// Seeded RNG (mulberry32) — deterministic worlds, same seed, same city.
+// Solmar Heat — a tiny seeded RNG so the city and traffic are the same every run.
 export function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -10,13 +10,18 @@ export function mulberry32(seed) {
   };
 }
 
-export function makeRng(seed) {
-  const next = mulberry32(seed);
-  return {
-    next,
-    range: (a, b) => a + next() * (b - a),
-    int: (a, b) => a + Math.floor(next() * (b - a + 1)),
-    pick: (arr) => arr[Math.floor(next() * arr.length)],
-    chance: (p) => next() < p,
-  };
+export function range(rng, min, max) {
+  return min + rng() * (max - min);
+}
+
+export function int(rng, min, max) {
+  return Math.floor(range(rng, min, max + 1));
+}
+
+export function pick(rng, list) {
+  return list[Math.floor(rng() * list.length)];
+}
+
+export function chance(rng, p) {
+  return rng() < p;
 }

@@ -1,131 +1,95 @@
-// Deterministic screenshot staging. Each scene is built from a fixed seed,
-// the simulation is stepped forward with a scripted autopilot, and the
-// camera SNAPS to its final position before capture (a lerping camera that
-// never settles ruins every shot). No randomness outside the seeded rng.
-import { CFG } from './config.js';
-import { PLACES, roadCoord } from './city.js';
-import { makeCar } from './vehicles.js';
-import { setWanted } from './wanted.js';
-import { MISSIONS } from './missions.js';
+// Solmar Heat — screenshot staging: deterministic scenes for the four
+// screenshots, with the camera snapped to its final pose (no drift).
+import { makeCar } from "./vehicles.js";
+import { startMission } from "./missions.js";
+import { addWanted } from "./police.js";
 
-// Put a car on a road with an exact pose.
-function placeCar(world, kind, x, z, heading, speed) {
-  const car = makeCar(world.rng, kind, x, z, heading);
-  car.speed = speed;
-  if (kind === 'traffic') {
-    car.axis = Math.abs(Math.sin(heading)) > 0.5 ? 'x' : 'z';
-    car.dir = Math.sin(heading) > 0.5 || Math.cos(heading) > 0.5 ? 1 : -1;
-    car.cruise = speed;
+function givePlayerCar(S, x, z, angle, speed, color) {
+  if (S.player.car) {
+    const i = S.cars.indexOf(S.player.car);
+    if (i >= 0) S.cars.splice(i, 1);
   }
+  const car = makeCar(x, z, angle, color, "player");
+  car.speed = speed;
+  S.cars.push(car);
+  S.player.car = car;
+  S.player.onFoot = false;
+  S.player.x = x;
+  S.player.z = z;
+  S.player.angle = angle;
   return car;
 }
 
-function behindCamera(car, dist, height, side = 0, lookAhead = 16) {
-  const fx = Math.sin(car.heading), fz = Math.cos(car.heading);
-  const rx = -fz, rz = fx; // right vector
-  return {
-    pos: [car.x - fx * dist + rx * side, height, car.z - fz * dist + rz * side],
-    look: [car.x + fx * lookAhead, 1.5, car.z + fz * lookAhead],
-  };
+function addCop(S, x, z, angle, speed) {
+  const cop = makeCar(x, z, angle, 0x1a1a1a, "police");
+  cop.speed = speed;
+  cop.route = [];
+  cop.routeIdx = 0;
+  S.cars.push(cop);
+  return cop;
 }
 
-export const SHOT_NAMES = ['cover', 'street', 'mission', 'title'];
-
-// Stage the world for one scene. Returns { steps, input, cameraFor } where
-// steps is how many 1/60s autopilot steps to run and cameraFor(world) gives
-// the final snapped camera {pos, look}.
-export function stageShot(world, name) {
-  const p = world.player;
-  if (name === 'cover') {
-    // Chase: player car at speed up the central avenue, three cruisers
-    // behind, traffic ahead on the parallel road, 3 stars on the HUD.
-    const roadX = roadCoord(5); // x = 26
-    const car = placeCar(world, 'player', roadX, 90, Math.PI, 38);
-    car.color = 0xd9382a; // bright red so the hero car pops
-    p.onFoot = false; p.car = car; p.x = car.x; p.z = car.z; p.heading = car.heading;
-    world.police = [
-      placeCar(world, 'police', roadX - 3.2, 100, Math.PI, 36),
-      placeCar(world, 'police', roadX + 3.2, 104, Math.PI, 36),
-      placeCar(world, 'police', roadX - 3.2, 112, Math.PI, 36),
-    ];
-    // Traffic stays clear of the player's lane so the chase never rear-ends.
-    world.traffic = [
-      placeCar(world, 'traffic', roadX - 52, 30, Math.PI, 12),
-      placeCar(world, 'traffic', roadX - 52, -40, Math.PI, 11),
-      placeCar(world, 'traffic', roadX, -90, Math.PI, 12),
-    ];
-    setWanted(world, 3);
-    world.objective = 'Lose the cops — reach the safehouse';
-    return {
-      steps: 30,
-      input: { throttle: 1, steer: 0 },
-      fov: 74, // wider lens so the cruisers behind the player stay in frame
-      cameraFor: () => behindCamera(p.car, 26, 11, -3, 16),
-    };
-  }
-
-  if (name === 'street') {
-    // Street level at the plaza: traffic crossing, pedestrians in frame.
-    const plaza = PLACES.plaza;
-    p.x = plaza.x + 4; p.z = plaza.z + 4; p.heading = Math.PI * 0.75; p.onFoot = true;
-    world.camYaw = Math.PI * 0.25;
-    world.traffic = [
-      placeCar(world, 'traffic', plaza.x, plaza.z - 60, 0, 11),
-      placeCar(world, 'traffic', plaza.x + 6.4, plaza.z - 30, 0, 12),
-      placeCar(world, 'traffic', plaza.x - 6.4, plaza.z + 40, Math.PI, 11),
-      placeCar(world, 'traffic', plaza.x - 60, plaza.z, Math.PI / 2, 10),
-      placeCar(world, 'traffic', plaza.x + 40, plaza.z + 6.4, -Math.PI / 2, 12),
-    ];
-    // Cluster pedestrians near the corner.
-    world.peds.forEach((ped, i) => {
-      ped.x = plaza.x + ((i * 7) % 24) - 12;
-      ped.z = plaza.z + ((i * 11) % 24) - 12;
-      ped.state = 'stroll';
+export function applyShot(S, name) {
+  // Clear any police the live game spawned, then stage the scene.
+  S.cars = S.cars.filter((c) => c.kind !== "police");
+  S.wanted = 0;
+  S.quietT = 99;
+  if (name === "chase") {
+    S.clock = 17 * 3600 + 45 * 60;
+    givePlayerCar(S, 26, 10, Math.PI, 38, 0xc0392b);
+    addCop(S, 24, 34, Math.PI, 40);
+    addCop(S, 29, 48, Math.PI, 40);
+    addWanted(S, 3);
+    S.quietT = 0;
+  } else if (name === "street") {
+    S.clock = 12 * 3600;
+    if (S.player.car) {
+      const i = S.cars.indexOf(S.player.car);
+      if (i >= 0) S.cars.splice(i, 1);
+      S.player.car = null;
+    }
+    S.player.onFoot = true;
+    S.player.x = 26;
+    S.player.z = 30;
+    S.player.angle = 0.6;
+    // Pack the plaza with traffic and pedestrians.
+    const spots = [[26, -20], [26, 74], [-20, 26], [74, 26], [26, -74], [78, 26]];
+    const traffic = S.cars.filter((c) => c.kind === "traffic");
+    traffic.forEach((car, i) => {
+      const s = spots[i % spots.length];
+      car.x = s[0];
+      car.z = s[1];
+      car.angle = i % 2 === 0 ? 0 : Math.PI / 2;
+      car.speed = 6;
     });
-    setWanted(world, 0);
-    world.wanted.heat = 0;
-    return {
-      steps: 60,
-      input: {},
-      cameraFor: () => ({
-        pos: [p.x + 16, 4, p.z + 12],
-        look: [p.x - 10, 1.5, p.z - 4],
-      }),
-    };
+    S.peds.forEach((p, i) => {
+      p.x = 26 + ((i * 37) % 50) - 25;
+      p.z = 26 + ((i * 23) % 44) - 22;
+      p.state = "walk";
+    });
+  } else if (name === "mission") {
+    S.clock = 15 * 3600 + 30 * 60;
+    startMission(S, 0);
+    givePlayerCar(S, 130, 135, 0, 20, 0xc0392b);
+  } else if (name === "title") {
+    S.clock = 18 * 3600 + 20 * 60;
+    if (S.player.car) {
+      const i = S.cars.indexOf(S.player.car);
+      if (i >= 0) S.cars.splice(i, 1);
+      S.player.car = null;
+    }
+    S.player.onFoot = true;
+    S.player.x = 0;
+    S.player.z = 100;
+    S.player.angle = Math.PI;
   }
-
-  if (name === 'mission') {
-    // Driving to the Hotel Solmar: beacon on the hotel, objective distance
-    // showing, car on the road at speed.
-    const hotel = PLACES.hotel;
-    const car = placeCar(world, 'player', hotel.x - 90, hotel.z, Math.PI / 2, 30);
-    car.color = 0x2e7ad9; // bright blue so the hero car pops
-    p.onFoot = false; p.car = car; p.x = car.x; p.z = car.z; p.heading = car.heading;
-    world.missions.active = true;
-    world.missions.index = 0;
-    world.missions.step = 1;
-    world.missions.timer = 0;
-    world.objective = MISSIONS[0].steps[1].text;
-    world.traffic = [
-      placeCar(world, 'traffic', hotel.x - 140, hotel.z + 6.4, Math.PI / 2, 11),
-      placeCar(world, 'traffic', hotel.x + 60, hotel.z - 6.4, -Math.PI / 2, 12),
-    ];
-    setWanted(world, 0);
-    world.wanted.heat = 0;
-    return {
-      steps: 30,
-      input: { throttle: 1, steer: 0 },
-      cameraFor: () => behindCamera(p.car, 15, 6, -2),
-    };
-  }
-
-  // title: high establishing shot over downtown, ocean behind.
-  return {
-    steps: 1,
-    input: {},
-    cameraFor: () => ({
-      pos: [-140, 95, 260],
-      look: [20, 10, -40],
-    }),
-  };
 }
+
+export function shotCamera(name) {
+  if (name === "chase") return { pos: [26, 9, 62], target: [26, 1, -5] };
+  if (name === "street") return { pos: [58, 22, 66], target: [24, 1, 24] };
+  if (name === "mission") return { pos: [130, 6, 105], target: [130, 2, 205] };
+  return { pos: [180, 95, 330], target: [0, 0, 40] };
+}
+
+export const SHOT_NAMES = ["chase", "street", "mission", "title"];

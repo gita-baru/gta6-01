@@ -1,162 +1,95 @@
-// The five jobs from Lena Voss. Each mission is a list of steps; a step is
-// completed by arriving at its target (or by doing its action).
-import { CFG, dist2d } from './config.js';
-import { PLACES } from './city.js';
+// Solmar Heat — the five story jobs from fixer Lena Voss. A small state
+// machine: each mission is a list of steps, each step a place or a trial.
+import { MISSIONS } from "./config.js";
+import { addWanted } from "./police.js";
 
-export const MISSIONS = [
-  {
-    id: 1, name: 'First Pickup', reward: 500, brief: 'Lena: pick up the package at the docks, deliver it to the Hotel Solmar.',
-    steps: [
-      { text: 'Collect the package at the docks', target: 'docks' },
-      { text: 'Deliver the package to the Hotel Solmar', target: 'hotel' },
-    ],
-  },
-  {
-    id: 2, name: 'Hot Wheels', reward: 1200, brief: 'Lena: steal the yellow Comet GT uptown and bring it to the garage. Cops are already on you.',
-    steps: [
-      { text: 'Steal the yellow Comet GT uptown', target: 'uptown', action: 'steal' },
-      { text: 'Bring the Comet GT to the garage', target: 'garage', action: 'deliverCar' },
-    ],
-  },
-  {
-    id: 3, name: 'The Getaway', reward: 2000, brief: 'Lena: lose the 3-star heat, then reach the safehouse. 90 seconds.',
-    timer: CFG.getawayTime,
-    steps: [
-      { text: 'Lose the cops (get wanted to zero)', target: null, action: 'loseHeat' },
-      { text: 'Reach the safehouse', target: 'safehouse' },
-    ],
-  },
-  {
-    id: 4, name: 'Night Run', reward: 1500, brief: 'Lena: three drops across the city, against the clock. 150 seconds.',
-    timer: CFG.nightRunTime,
-    steps: [
-      { text: 'Drop 1 of 3: the pier', target: 'pier' },
-      { text: 'Drop 2 of 3: the plaza', target: 'plaza' },
-      { text: 'Drop 3 of 3: the marina', target: 'marina' },
-    ],
-  },
-  {
-    id: 5, name: 'Heat Wave', reward: 3000, brief: 'Lena: lose 4-star heat with the helicopter up, then reach the safehouse.',
-    steps: [
-      { text: 'Lose the cops and the helicopter', target: null, action: 'loseHeat' },
-      { text: 'Reach the safehouse', target: 'safehouse' },
-    ],
-  },
-];
-
-export function makeMissionState() {
-  return { index: 0, active: false, step: 0, timer: 0, failed: false, done: false, message: '' };
-}
-
-// Start mission i (0-based). Applies mission-specific setup (wanted level, the
-// Comet GT for mission 2). Returns the mission definition.
-export function startMission(world, i) {
-  const def = MISSIONS[i];
-  const ms = world.missions;
-  ms.index = i;
-  ms.active = true;
-  ms.step = 0;
-  ms.failed = false;
-  ms.done = false;
-  ms.timer = def.timer || 0;
-  ms.message = def.brief;
-  world.objective = def.steps[0].text;
-  if (def.id === 2) {
-    world.wanted.stars = 2;
-    world.wanted.heat = 2;
-    spawnCometGT(world);
-  }
-  if (def.id === 3) {
-    world.wanted.stars = 3;
-    world.wanted.heat = 3;
-  }
-  if (def.id === 5) {
-    world.wanted.stars = 4;
-    world.wanted.heat = 4;
-  }
-  return def;
-}
-
-// The yellow Comet GT waiting uptown for mission 2.
-export function spawnCometGT(world) {
-  if (world.comet) return;
-  const p = PLACES.uptown;
-  world.comet = {
-    kind: 'traffic', x: p.x + 4, z: p.z, heading: Math.PI / 2, speed: 0,
-    color: 0xf2c200, axis: 'x', dir: 1, lane: 3.2, cruise: 0,
-    path: [], pathIdx: 0, repath: 0, ram: false, siren: false, crashed: 0,
-    comet: true,
+export function startMission(S, index) {
+  const m = MISSIONS[index];
+  const done = S.mission.done;
+  S.mission = {
+    index,
+    step: 0,
+    active: true,
+    targetCar: null,
+    timer: m.steps[0].time || 0,
+    text: m.steps[0].text,
+    done,
   };
-  world.traffic.push(world.comet);
+  if (m.id === "getaway") addWanted(S, 3);
+  if (m.id === "nightrun") S.clock = 21 * 3600;
+  if (m.id === "heatwave") addWanted(S, 5);
+  if (m.id === "hotwheels") {
+    const comet = S.cars.find((c) => c.kind === "mission");
+    if (comet) S.mission.targetCar = comet.id;
+  }
+  S.fx.push({ type: "mission", text: `${m.name}: ${m.briefing}` });
+  return m;
 }
 
-export function currentStep(world) {
-  const ms = world.missions;
-  if (!ms.active) return null;
-  return MISSIONS[ms.index].steps[ms.step] || null;
+export function currentObjective(S) {
+  if (!S.mission.active) return null;
+  const m = MISSIONS[S.mission.index];
+  const step = m.steps[S.mission.step];
+  if (!step) return null;
+  if (step.type === "survive") {
+    return { text: step.text, x: S.player.x, z: S.player.z, dist: 0, timer: S.mission.timer };
+  }
+  const dist = Math.hypot(step.x - S.player.x, step.z - S.player.z);
+  return { text: step.text, x: step.x, z: step.z, dist, timer: S.mission.timer };
 }
 
-export function currentTarget(world) {
-  const step = currentStep(world);
-  if (!step || !step.target) return null;
-  return PLACES[step.target];
+function advance(S) {
+  const m = MISSIONS[S.mission.index];
+  S.mission.step++;
+  if (S.mission.step >= m.steps.length) {
+    S.money += m.reward;
+    S.mission.done[S.mission.index] = true;
+    S.mission.active = false;
+    S.fx.push({ type: "paid", text: `${m.name} complete — $${m.reward.toLocaleString("en-US")}` });
+    S.fx.push({ type: "pickup" });
+    return { type: "complete", mission: m };
+  }
+  const step = m.steps[S.mission.step];
+  S.mission.text = step.text;
+  S.mission.timer = step.time || 0;
+  return { type: "step", mission: m, step };
 }
 
-export function updateMissions(world, dt) {
-  const ms = world.missions;
-  if (!ms.active || ms.failed || ms.done) return;
-  const def = MISSIONS[ms.index];
-  if (ms.timer > 0) {
-    ms.timer -= dt;
-    if (ms.timer <= 0) {
-      ms.failed = true;
-      ms.active = false;
-      ms.message = `Time up — ${def.name} failed. Press T to retry.`;
-      world.objective = 'Job failed — press T to retry';
-      return;
+// Returns an event object when a step completes, a mission ends or fails.
+export function updateMission(S, dt) {
+  if (!S.mission.active) return null;
+  const m = MISSIONS[S.mission.index];
+  const step = m.steps[S.mission.step];
+  if (!step) return null;
+  if (step.type === "goto") {
+    const d = Math.hypot(step.x - S.player.x, step.z - S.player.z);
+    if (d < step.radius) {
+      S.fx.push({ type: "pickup" });
+      return advance(S);
     }
-  }
-  const step = def.steps[ms.step];
-  if (!step) return;
-  const pos = world.player.onFoot
-    ? { x: world.player.x, z: world.player.z }
-    : { x: world.player.car.x, z: world.player.car.z };
-  const arrive = (target) => dist2d(pos.x, pos.z, target.x, target.z) < CFG.arriveRadius;
-
-  if (step.action === 'steal') {
-    // Complete when the player is driving the Comet GT.
-    if (!world.player.onFoot && world.player.car && world.player.car.comet) {
-      advance(world);
+  } else if (step.type === "steal") {
+    const car = S.player.car;
+    if (car && S.mission.targetCar === car.id) return advance(S);
+  } else if (step.type === "timed") {
+    S.mission.timer -= dt;
+    if (S.mission.timer <= 0) {
+      S.mission.active = false;
+      S.fx.push({ type: "fail", text: `${m.name} failed — out of time` });
+      return { type: "failed", mission: m };
     }
-    return;
+    const d = Math.hypot(step.x - S.player.x, step.z - S.player.z);
+    if (d < step.radius) return advance(S);
+  } else if (step.type === "survive") {
+    S.mission.timer -= dt;
+    if (S.wanted < 5) addWanted(S, 5 - S.wanted);
+    if (S.mission.timer <= 0) return advance(S);
   }
-  if (step.action === 'deliverCar') {
-    if (!world.player.onFoot && world.player.car && world.player.car.comet && arrive(PLACES[step.target])) {
-      advance(world);
-    }
-    return;
-  }
-  if (step.action === 'loseHeat') {
-    if (world.wanted.stars === 0) advance(world);
-    return;
-  }
-  if (step.target && arrive(PLACES[step.target])) advance(world);
+  return null;
 }
 
-function advance(world) {
-  const ms = world.missions;
-  const def = MISSIONS[ms.index];
-  ms.step++;
-  if (ms.step >= def.steps.length) {
-    ms.done = true;
-    ms.active = false;
-    world.cash += def.reward;
-    world.player.ammo = Math.min(CFG.pistolAmmoMax, world.player.ammo + 12);
-    world.stats.missionsDone++;
-    ms.message = `${def.name} complete — $${def.reward.toLocaleString()}!`;
-    world.objective = 'Job done — press T for the next job';
-    return;
+export function nextMissionIndex(S) {
+  for (let i = 0; i < MISSIONS.length; i++) {
+    if (!S.mission.done[i]) return i;
   }
-  world.objective = def.steps[ms.step].text;
-  ms.message = def.steps[ms.step].text;
+  return -1;
 }

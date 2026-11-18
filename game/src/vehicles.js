@@ -1,150 +1,130 @@
-// Cars: arcade driving, traffic AI, police pursuit (BFS over the road grid),
-// and the police helicopter. Pure simulation — no DOM, no three.js.
-import { CFG, clamp, angleDiff, dist2d } from './config.js';
-import { roadCoord, nearestNode, bfsPath } from './city.js';
+// Solmar Heat — cars: arcade driving physics and traffic AI. Pure logic.
+import { TUNE } from "./config.js";
+import { bfs, insideBuilding, nearestNode, nearestRoadPoint, onSand, randomRoadPoint } from "./city.js";
+import { pick, range } from "./random.js";
 
-export const CAR_COLORS = [
-  0x8a8f98, 0x2e4a6b, 0x7a2e2e, 0x3f6b3a, 0xc0c0c0, 0x1c1c22, 0xb0893c, 0x5b4a7a,
-];
+let nextId = 1;
 
-export function makeCar(rng, kind, x, z, heading = 0) {
+export function makeCar(x, z, angle, color, kind) {
   return {
-    kind, // 'player' | 'traffic' | 'police'
-    x, z, heading,
+    id: nextId++,
+    x, z, angle,
     speed: 0,
-    color: kind === 'police' ? 0x11131a : rng.pick(CAR_COLORS),
-    // traffic AI state
-    axis: 'x', dir: 1, lane: 3.2,
-    cruise: rng.range(CFG.trafficSpeedMin, CFG.trafficSpeedMax),
-    // police state
-    path: [], pathIdx: 0, repath: 0,
-    ram: false,
-    siren: kind === 'police',
-    crashed: 0, // brief slowdown after a hit
+    steer: 0,
+    color,
+    kind, // 'traffic' | 'parked' | 'police' | 'mission' | 'player'
+    route: [],
+    routeIdx: 0,
+    repathT: 0,
+    hp: 100,
+    disabled: false,
   };
 }
 
-// Arcade car physics. input: {throttle (-1..1), steer (-1..1), handbrake}.
-export function stepCarPhysics(car, input, dt) {
-  const maxF = CFG.carMaxSpeed;
-  const maxR = CFG.carReverseMax;
-  if (input.throttle > 0) car.speed += CFG.carAccel * input.throttle * dt;
-  else if (input.throttle < 0) {
-    const t = -input.throttle;
-    if (car.speed > 0.5) car.speed -= CFG.carBrake * t * dt;   // brake
-    else car.speed -= CFG.carAccel * 0.6 * t * dt;              // reverse
+// Arcade driving: throttle, steering that bites harder with speed, and a
+// handbrake that cuts grip so the tail steps out. Returns distance driven.
+export function driveCar(car, input, dt, city) {
+  const was = { x: car.x, z: car.z };
+  const sand = onSand(car.z);
+  const grip = input.handbrake ? TUNE.handbrakeGrip : 1;
+  const accel = input.up ? TUNE.carAccel : input.down ? -TUNE.carBrake : 0;
+  car.speed += accel * dt;
+  if (!input.up && !input.down) car.speed -= car.speed * TUNE.carDrag * dt;
+  if (input.down && car.speed < 0.5) car.speed = Math.max(car.speed, -TUNE.carReverse);
+  const max = (sand ? 0.45 : 1) * TUNE.carMaxSpeed;
+  car.speed = Math.max(-TUNE.carReverse, Math.min(max, car.speed));
+  const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
+  car.steer += (steerTarget - car.steer) * Math.min(1, dt * 8);
+  const dir = car.speed >= 0 ? 1 : -1;
+  car.angle += car.steer * TUNE.steerRate * grip * dt * Math.min(1, Math.abs(car.speed) / 8) * dir;
+  car.x += Math.sin(car.angle) * car.speed * dt;
+  car.z += Math.cos(car.angle) * car.speed * dt;
+  const hit = insideBuilding(city, car.x, car.z, 1.6);
+  if (hit) {
+    // Push out along the smaller penetration axis and kill the speed.
+    const dx = car.x - hit.x;
+    const dz = car.z - hit.z;
+    const px = hit.hw + 1.6 - Math.abs(dx);
+    const pz = hit.hd + 1.6 - Math.abs(dz);
+    if (px < pz) car.x = hit.x + Math.sign(dx || 1) * (hit.hw + 1.6);
+    else car.z = hit.z + Math.sign(dz || 1) * (hit.hd + 1.6);
+    car.speed *= 0.35;
   }
-  car.speed -= car.speed * CFG.carDrag * dt;
-  if (input.handbrake) car.speed -= Math.sign(car.speed) * CFG.carBrake * 0.8 * dt;
-  car.speed = clamp(car.speed, -maxR, maxF);
-  if (Math.abs(car.speed) < 0.05 && input.throttle === 0) car.speed = 0;
-  const steerAuthority = clamp(Math.abs(car.speed) / 8, 0, 1);
-  car.heading += input.steer * CFG.steerRate * steerAuthority * dt * Math.sign(car.speed || 1);
-  if (input.handbrake) car.heading += input.steer * CFG.steerRate * 0.6 * dt * Math.sign(car.speed || 1);
-  car.x += Math.sin(car.heading) * car.speed * dt;
-  car.z += Math.cos(car.heading) * car.speed * dt;
+  if (car.z > 320) {
+    car.z = 320;
+    car.speed *= 0.5;
+  }
+  if (Math.abs(car.x) > 246) {
+    car.x = Math.sign(car.x) * 246;
+    car.speed *= 0.5;
+  }
+  if (car.z < -246) {
+    car.z = -246;
+    car.speed *= 0.5;
+  }
+  return Math.hypot(car.x - was.x, car.z - was.z);
 }
 
-// --- Traffic: lane-following on the road grid, turns at intersections. ---
-export function spawnTraffic(rng, count, avoid) {
+// Spawn n traffic cars on the roads, each with a route to follow.
+export function makeTraffic(n, city, rng) {
   const cars = [];
-  for (let n = 0; n < count; n++) {
-    const i = rng.int(0, 9), j = rng.int(0, 9);
-    const axis = rng.chance(0.5) ? 'x' : 'z';
-    const car = makeCar(rng, 'traffic', roadCoord(i), roadCoord(j), axis === 'x' ? Math.PI / 2 : 0);
-    car.axis = axis;
-    car.dir = rng.chance(0.5) ? 1 : -1;
-    car.lane = rng.chance(0.5) ? 3.2 : -3.2;
-    if (axis === 'x') { car.z = roadCoord(j) + car.lane; car.heading = car.dir > 0 ? Math.PI / 2 : -Math.PI / 2; }
-    else { car.x = roadCoord(i) + car.lane; car.heading = car.dir > 0 ? 0 : Math.PI; }
-    car.speed = car.cruise;
-    if (avoid && dist2d(car.x, car.z, avoid.x, avoid.z) < 40) { n--; continue; }
+  for (let i = 0; i < n; i++) {
+    const p = randomRoadPoint(rng);
+    const dest = randomRoadPoint(rng);
+    const car = makeCar(p.x, p.z, rng() * Math.PI * 2, pick(rng, [0xc0392b, 0x2e86c1, 0xf1c40f, 0x95a5a6, 0x2c3e50, 0xe67e22]), "traffic");
+    car.route = bfs(city, nearestNode(city, p.x, p.z).id, nearestNode(city, dest.x, dest.z).id);
+    car.routeIdx = 1;
+    car.speed = range(rng, 7, 11);
     cars.push(car);
   }
   return cars;
 }
 
-function atIntersection(car) {
-  const n = nearestNode(car.x, car.z);
-  const dx = car.x - roadCoord(n.i), dz = car.z - roadCoord(n.j);
-  return Math.hypot(dx, dz) < 3 ? n : null;
+// One traffic car follows its route node to node, easing into corners.
+export function updateTraffic(car, dt, city, rng) {
+  if (car.disabled) return;
+  if (car.routeIdx >= car.route.length) {
+    const dest = randomRoadPoint(rng);
+    car.route = bfs(city, nearestNode(city, car.x, car.z).id, nearestNode(city, dest.x, dest.z).id);
+    car.routeIdx = 1;
+    if (car.route.length < 2) return;
+  }
+  const node = city.nodes[car.route[car.routeIdx]];
+  const dx = node.x - car.x;
+  const dz = node.z - car.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist < 3) {
+    car.routeIdx++;
+    return;
+  }
+  const want = Math.atan2(dx, dz);
+  let diff = want - car.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  car.angle += Math.max(-2.4 * dt, Math.min(2.4 * dt, diff));
+  const target = Math.abs(diff) > 0.9 ? 5 : TUNE.trafficSpeed;
+  car.speed += (target - car.speed) * Math.min(1, dt * 1.5);
+  car.x += Math.sin(car.angle) * car.speed * dt;
+  car.z += Math.cos(car.angle) * car.speed * dt;
 }
 
-export function stepTraffic(car, rng, dt) {
-  // Drive along the current axis; snap the cross axis to the lane.
-  const speed = car.crashed > 0 ? car.cruise * 0.3 : car.cruise;
-  car.crashed = Math.max(0, car.crashed - dt);
-  if (car.axis === 'x') {
-    car.x += car.dir * speed * dt;
-    car.z += (roadCoord(nearestNode(car.x, car.z).j) + car.lane - car.z) * Math.min(1, dt * 4);
-    car.heading = car.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
-  } else {
-    car.z += car.dir * speed * dt;
-    car.x += (roadCoord(nearestNode(car.x, car.z).i) + car.lane - car.x) * Math.min(1, dt * 4);
-    car.heading = car.dir > 0 ? 0 : Math.PI;
-  }
-  const node = atIntersection(car);
-  if (node && rng.chance(0.35)) {
-    // Turn: pick a perpendicular leg (never a U-turn).
-    const turnLeft = rng.chance(0.5);
-    if (car.axis === 'x') {
-      const newDir = turnLeft ? (car.dir > 0 ? -1 : 1) : (car.dir > 0 ? 1 : -1);
-      car.axis = 'z'; car.dir = newDir; car.lane = rng.chance(0.5) ? 3.2 : -3.2;
-    } else {
-      const newDir = turnLeft ? (car.dir > 0 ? 1 : -1) : (car.dir > 0 ? -1 : 1);
-      car.axis = 'x'; car.dir = newDir; car.lane = rng.chance(0.5) ? 3.2 : -3.2;
+export function nearestCar(cars, x, z, maxD, kinds) {
+  let best = null;
+  let bestD = maxD;
+  for (const c of cars) {
+    if (kinds && !kinds.includes(c.kind)) continue;
+    if (c.disabled) continue;
+    const d = Math.hypot(c.x - x, c.z - z);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
     }
-    car.x = roadCoord(node.i);
-    car.z = roadCoord(node.j);
   }
-  // Keep inside the city: wrap around the far edge.
-  if (car.x < CFG.cityMin - 10 || car.x > CFG.cityMax + 10 || car.z < CFG.cityMin - 10 || car.z > CFG.cityMax + 10) {
-    car.x = roadCoord(rng.int(0, 9));
-    car.z = roadCoord(rng.int(0, 9));
-  }
+  return best;
 }
 
-// --- Police: BFS route to the player, ram when close. ---
-export function stepPolice(car, target, rng, dt) {
-  car.repath -= dt;
-  const myNode = nearestNode(car.x, car.z);
-  const tgtNode = nearestNode(target.x, target.z);
-  const d = dist2d(car.x, car.z, target.x, target.z);
-  car.ram = d < CFG.policeRamDist;
-  if (car.repath <= 0 || car.pathIdx >= car.path.length) {
-    car.path = bfsPath(myNode.i, myNode.j, tgtNode.i, tgtNode.j);
-    car.pathIdx = 0;
-    car.repath = 1.2;
-  }
-  let goal;
-  if (car.ram) {
-    goal = { x: target.x, z: target.z };
-    car.speed = Math.min(car.speed + CFG.carAccel * 1.2 * dt, CFG.policeRamSpeed);
-  } else if (car.path.length) {
-    goal = car.path[Math.min(car.pathIdx, car.path.length - 1)];
-    if (dist2d(car.x, car.z, goal.x, goal.z) < 5) car.pathIdx++;
-    car.speed = Math.min(car.speed + CFG.carAccel * dt, CFG.carMaxSpeed * 0.85);
-  } else {
-    goal = { x: target.x, z: target.z };
-    car.speed = Math.min(car.speed + CFG.carAccel * dt, CFG.carMaxSpeed * 0.7);
-  }
-  const want = Math.atan2(goal.x - car.x, goal.z - car.z);
-  const turn = clamp(angleDiff(car.heading, want) * 2.2, -1, 1);
-  car.heading += turn * CFG.steerRate * dt * (car.speed > 1 ? 1 : 0.4);
-  car.x += Math.sin(car.heading) * car.speed * dt;
-  car.z += Math.cos(car.heading) * car.speed * dt;
-}
-
-// --- Helicopter: hovers above the player once wanted hits 4 stars. ---
-export function makeHeli() {
-  return { x: 0, z: 0, y: 46, heading: 0, rotor: 0, active: false };
-}
-
-export function stepHeli(heli, target, dt) {
-  heli.rotor += dt * 22;
-  const tx = target.x + 12, tz = target.z - 8;
-  heli.x += (tx - heli.x) * Math.min(1, dt * 0.9);
-  heli.z += (tz - heli.z) * Math.min(1, dt * 0.9);
-  heli.y += (46 + Math.sin(heli.rotor * 0.05) * 2 - heli.y) * Math.min(1, dt * 1.5);
-  heli.heading += dt * 0.4;
+export function snapCarToRoad(car, city) {
+  const p = nearestRoadPoint(car.x, car.z);
+  car.x = p.x;
+  car.z = p.z;
 }

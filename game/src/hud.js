@@ -1,131 +1,133 @@
-// HUD: cash, stars, health, speed, objective + distance, clock, live minimap,
-// and the start / pause / busted / wasted screens. Browser only.
-import { CFG } from './config.js';
-import { roadCoord } from './city.js';
-import { objectiveInfo, clockString, playerPos } from './world.js';
+// Solmar Heat — the HUD (DOM) and the live minimap (2D canvas).
+import { BOUND } from "./config.js";
+import { stars } from "./police.js";
+import { currentObjective } from "./missions.js";
 
-export function createHud(world) {
-  const $ = (id) => document.getElementById(id);
-  const els = {
-    cash: $('hud-cash'), stars: $('hud-stars'), health: $('hud-health-fill'),
-    speed: $('hud-speed'), objective: $('hud-objective'), clock: $('hud-clock'),
-    ammo: $('hud-ammo'), toast: $('hud-toast'), minimap: $('minimap'),
-    screens: { start: $('screen-start'), pause: $('screen-pause'), busted: $('screen-busted'), wasted: $('screen-wasted') },
-    menuCash: $('menu-cash'), menuMissions: $('menu-missions'),
-  };
-  const mm = els.minimap.getContext('2d');
-  let toastT = 0;
-  return {
-    showToast(text, seconds = 4) {
-      els.toast.textContent = text;
-      els.toast.style.opacity = '1';
-      toastT = seconds;
-    },
-    showScreen(name) {
-      for (const [key, el] of Object.entries(els.screens)) {
-        el.classList.toggle('hidden', key !== name);
-      }
-      if (name === 'start') {
-        els.menuCash.textContent = `$${world.cash.toLocaleString()}`;
-        els.menuMissions.textContent = `${world.stats.missionsDone} of 5 jobs done`;
-      }
-    },
-    hideScreens() {
-      for (const el of Object.values(els.screens)) el.classList.add('hidden');
-    },
-    update(dt) {
-      const p = world.player;
-      els.cash.textContent = `$${world.cash.toLocaleString()}`;
-      els.stars.textContent = '★'.repeat(world.wanted.stars) + '☆'.repeat(CFG.maxStars - world.wanted.stars);
-      els.stars.style.color = world.wanted.stars >= 4 ? '#ff4444' : world.wanted.stars > 0 ? '#ffcc22' : '#ffffff';
-      els.health.style.width = `${Math.max(0, p.health)}%`;
-      els.health.style.background = p.health > 50 ? '#4caf50' : p.health > 25 ? '#ff9800' : '#f44336';
-      const speedKmh = p.onFoot ? Math.round(p.speed * 3.6) : Math.round(Math.abs(p.car.speed) * 3.6);
-      els.speed.textContent = `${speedKmh} km/h`;
-      els.clock.textContent = clockString(world);
-      els.ammo.textContent = p.onFoot ? `🔫 ${p.ammo}` : '';
-      const obj = objectiveInfo(world);
-      els.objective.textContent = obj.dist !== null
-        ? `${obj.text} — ${obj.dist} m` : obj.text;
-      if (toastT > 0) {
-        toastT -= dt;
-        if (toastT <= 0) els.toast.style.opacity = '0';
-      }
-      drawMinimap(mm, world, els.minimap.width);
-    },
-  };
+function el(id) {
+  return document.getElementById(id);
 }
 
-function drawMinimap(g, world, size) {
-  const S = size;
-  const toMap = (x, z) => [
-    ((x - CFG.cityMin) / (CFG.cityMax - CFG.cityMin)) * (S - 16) + 8,
-    ((z - CFG.cityMin) / (CFG.cityMax - CFG.cityMin)) * (S - 16) + 8,
-  ];
-  g.clearRect(0, 0, S, S);
-  g.fillStyle = 'rgba(10, 16, 24, 0.82)';
-  g.fillRect(0, 0, S, S);
-  // Blocks.
-  g.fillStyle = '#3a4a5a';
-  for (let i = 0; i < 9; i++) {
-    for (let j = 0; j < 9; j++) {
-      const [x, z] = toMap(roadCoord(i) + 26, roadCoord(j) + 26);
-      g.fillRect(x - 9, z - 9, 18, 18);
+export function fmtMoney(n) {
+  return "$" + Math.floor(n).toLocaleString("en-US");
+}
+
+export function fmtClock(seconds) {
+  const h = Math.floor(seconds / 3600) % 24;
+  const m = Math.floor(seconds / 60) % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+
+export function updateHud(S, audio) {
+  el("money").textContent = fmtMoney(S.money);
+  const s = stars(S);
+  el("stars").textContent = "★".repeat(s) + "☆".repeat(5 - s);
+  el("stars").style.color = s >= 4 ? "#ff4d4d" : s >= 2 ? "#ffcc00" : "#ffffff";
+  const hp = el("health-fill");
+  hp.style.width = Math.max(0, S.health) + "%";
+  hp.style.background = S.health > 50 ? "#2ecc71" : S.health > 25 ? "#f39c12" : "#e74c3c";
+  const speed = S.player.onFoot ? 0 : Math.abs(S.player.car ? S.player.car.speed : 0);
+  el("speed").textContent = Math.round(speed * 3.6) + " km/h";
+  el("ammo").textContent = "Ammo " + S.ammo;
+  el("clock").textContent = fmtClock(S.clock);
+  el("radio").textContent = "♪ " + (audio ? audio.stationName() : "SOLMAR FM");
+  const obj = currentObjective(S);
+  if (obj) {
+    el("objective").textContent = obj.text;
+    el("obj-dist").textContent =
+      obj.timer > 0 ? Math.ceil(obj.timer) + "s" : Math.round(obj.dist) + " m";
+  } else if (S.mission.done.every(Boolean)) {
+    el("objective").textContent = "All jobs done — Solmar is yours.";
+    el("obj-dist").textContent = "";
+  } else {
+    el("objective").textContent = "Press T to start the next job";
+    el("obj-dist").textContent = "";
+  }
+  if (S.bannerT > 0) {
+    el("banner").textContent = S.banner;
+    el("banner").style.opacity = "1";
+  } else {
+    el("banner").style.opacity = "0";
+  }
+  drawMinimap(S);
+}
+
+function drawMinimap(S) {
+  const c = el("minimap");
+  if (!c) return;
+  const ctx = c.getContext("2d");
+  const W = c.width;
+  const H = c.height;
+  const scale = W / (BOUND * 2 + 120);
+  const toX = (x) => W / 2 + x * scale;
+  const toY = (z) => H / 2 + z * scale;
+  ctx.fillStyle = "#0d1b2a";
+  ctx.fillRect(0, 0, W, H);
+  // Ocean and sand (south).
+  ctx.fillStyle = "#155e8a";
+  ctx.fillRect(0, toY(288), W, H - toY(288));
+  ctx.fillStyle = "#d9c48a";
+  ctx.fillRect(0, toY(244), W, toY(288) - toY(244));
+  // Roads.
+  ctx.strokeStyle = "#5a5f6a";
+  ctx.lineWidth = 3;
+  for (let i = -234; i <= 234; i += 52) {
+    ctx.beginPath();
+    ctx.moveTo(toX(i), toY(-240));
+    ctx.lineTo(toX(i), toY(240));
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(toX(-240), toY(i));
+    ctx.lineTo(toX(240), toY(i));
+    ctx.stroke();
+  }
+  // Mission target.
+  const obj = currentObjective(S);
+  if (obj && obj.dist > 0) {
+    const pulse = 4 + Math.sin(S.time * 5) * 2;
+    ctx.fillStyle = "#f1c40f";
+    ctx.beginPath();
+    ctx.arc(toX(obj.x), toY(obj.z), pulse, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Traffic.
+  ctx.fillStyle = "#cfd8dc";
+  for (const car of S.cars) {
+    if (car.kind === "traffic" || car.kind === "parked") {
+      ctx.fillRect(toX(car.x) - 1.5, toY(car.z) - 1.5, 3, 3);
     }
   }
-  // Roads.
-  g.strokeStyle = '#6a7a8a';
-  g.lineWidth = 2;
-  for (let i = 0; i < 10; i++) {
-    const [a] = toMap(roadCoord(i), 0);
-    g.beginPath(); g.moveTo(a, 4); g.lineTo(a, S - 4); g.stroke();
-    const [, b] = toMap(0, roadCoord(i));
-    g.beginPath(); g.moveTo(4, b); g.lineTo(S - 4, b); g.stroke();
+  // Police.
+  ctx.fillStyle = "#ff5252";
+  for (const car of S.cars) {
+    if (car.kind === "police") {
+      ctx.beginPath();
+      ctx.arc(toX(car.x), toY(car.z), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
-  // Beach / ocean.
-  g.fillStyle = '#d9c08a';
-  g.fillRect(4, S - 14, S - 8, 6);
-  g.fillStyle = '#1a6f8f';
-  g.fillRect(4, S - 8, S - 8, 4);
-  // Mission target.
-  const obj = objectiveInfo(world);
-  if (obj.target) {
-    const [x, z] = toMap(obj.target.x, obj.target.z);
-    g.fillStyle = '#ffd21a';
-    g.beginPath(); g.arc(x, z, 5, 0, Math.PI * 2); g.fill();
-    g.strokeStyle = '#ffd21a'; g.lineWidth = 1.5;
-    g.beginPath(); g.arc(x, z, 8, 0, Math.PI * 2); g.stroke();
-  }
-  // Police (red), traffic (grey), peds (dots).
-  g.fillStyle = '#ff4444';
-  for (const c of world.police) {
-    const [x, z] = toMap(c.x, c.z);
-    g.fillRect(x - 2.5, z - 2.5, 5, 5);
-  }
-  if (world.heli.active) {
-    const [x, z] = toMap(world.heli.x, world.heli.z);
-    g.fillStyle = '#ff8844';
-    g.beginPath(); g.arc(x, z, 4, 0, Math.PI * 2); g.fill();
-  }
-  g.fillStyle = '#bbbbbb';
-  for (const c of world.traffic) {
-    const [x, z] = toMap(c.x, c.z);
-    g.fillRect(x - 1.5, z - 1.5, 3, 3);
+  // Helicopter.
+  if (S.heli.active) {
+    ctx.fillStyle = "#ff8a65";
+    ctx.beginPath();
+    ctx.arc(toX(S.heli.x), toY(S.heli.z), 4, 0, Math.PI * 2);
+    ctx.fill();
   }
   // Player arrow.
-  const pos = playerPos(world);
-  const [px, pz] = toMap(pos.x, pos.z);
-  const heading = world.player.heading;
-  g.fillStyle = '#ffffff';
-  g.save();
-  g.translate(px, pz);
-  g.rotate(Math.atan2(Math.sin(heading), -Math.cos(heading)) * -1 + Math.PI);
-  g.beginPath();
-  g.moveTo(0, -7); g.lineTo(5, 6); g.lineTo(0, 3); g.lineTo(-5, 6); g.closePath();
-  g.fill();
-  g.restore();
-  // North label.
-  g.fillStyle = '#9ab';
-  g.font = 'bold 10px sans-serif';
-  g.fillText('N', S - 14, 14);
+  ctx.save();
+  ctx.translate(toX(S.player.x), toY(S.player.z));
+  ctx.rotate(Math.atan2(Math.sin(S.player.angle), Math.cos(S.player.angle)) + Math.PI);
+  ctx.fillStyle = "#2ecc71";
+  ctx.beginPath();
+  ctx.moveTo(0, -6);
+  ctx.lineTo(4, 5);
+  ctx.lineTo(-4, 5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+export function showScreen(name) {
+  for (const id of ["title-screen", "pause-screen", "busted-screen", "wasted-screen"]) {
+    el(id).style.display = id === name ? "flex" : "none";
+  }
 }

@@ -1,83 +1,134 @@
-// Solmar City layout: a 10x10 road grid (9x9 blocks), beach and ocean south.
-// Pure data — no DOM, no three.js, so the sim tests can import it in Node.
-import { CFG } from './config.js';
+// Solmar Heat — the city model: streets, blocks, buildings and the road
+// graph the traffic and the police drive on. Pure logic, no rendering.
+import { BLOCK, BOUND, BUILDING_COLORS, PITCH, STREETS } from "./config.js";
+import { chance, int, mulberry32, pick, range } from "./random.js";
 
-export const roadCoord = (i) => CFG.cityMin + i * CFG.pitch;
-
-// Named places, given as grid intersections (i, j) so they always sit on roads.
-const PLACE_GRID = {
-  docks: [1, 9],       // south-west, on the beach road
-  pier: [3, 9],
-  hotel: [7, 4],       // Hotel Solmar, mid-east
-  garage: [1, 1],      // north-west
-  safehouse: [8, 0],   // north-east
-  plaza: [5, 5],       // central square
-  marina: [9, 8],      // south-east waterfront
-  stadium: [2, 6],
-  mall: [4, 2],
-  uptown: [6, 1],      // where the yellow Comet GT waits
-  hospital: [5, 3],
-};
-
-export const PLACES = {};
-for (const [name, [i, j]] of Object.entries(PLACE_GRID)) {
-  PLACES[name] = { x: roadCoord(i), z: roadCoord(j), i, j, label: name };
+export function nodeId(ix, iz) {
+  return iz * 10 + ix;
 }
 
-// Clamp a point into the drivable city, then snap it onto the nearest road.
-export function nearestRoadPoint(x, z) {
-  const c = (v) => {
-    const clamped = Math.max(CFG.cityMin, Math.min(CFG.cityMax, v));
-    const i = Math.round((clamped - CFG.cityMin) / CFG.pitch);
-    return roadCoord(Math.max(0, Math.min(CFG.roads - 1, i)));
-  };
-  const rx = c(x);
-  const rz = c(z);
-  // Pick the nearer road axis.
-  return Math.abs(x - rx) < Math.abs(z - rz) ? { x: rx, z } : { x, z: rz };
-}
-
-export function nearestNode(x, z) {
-  const idx = (v) => Math.max(0, Math.min(CFG.roads - 1,
-    Math.round((v - CFG.cityMin) / CFG.pitch)));
-  return { i: idx(x), j: idx(z) };
-}
-
-// Breadth-first search over the intersection graph. Returns waypoints
-// [{x, z}, ...] from the start node (exclusive) to the target node (inclusive).
-export function bfsPath(si, sj, ti, tj) {
-  if (si === ti && sj === tj) return [];
-  const key = (i, j) => j * CFG.roads + i;
-  const prev = new Map();
-  const queue = [[si, sj]];
-  prev.set(key(si, sj), null);
-  while (queue.length) {
-    const [i, j] = queue.shift();
-    if (i === ti && j === tj) break;
-    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const ni = i + di, nj = j + dj;
-      if (ni < 0 || nj < 0 || ni >= CFG.roads || nj >= CFG.roads) continue;
-      const k = key(ni, nj);
-      if (prev.has(k)) continue;
-      prev.set(k, [i, j]);
-      queue.push([ni, nj]);
+// Build the whole city from one seed: blocks, buildings and the road graph.
+export function buildCity(seed) {
+  const rng = mulberry32(seed);
+  const blocks = [];
+  const buildings = [];
+  for (let bx = 0; bx < 9; bx++) {
+    for (let bz = 0; bz < 9; bz++) {
+      const cx = -208 + bx * PITCH;
+      const cz = -208 + bz * PITCH;
+      const kind = chance(rng, 0.14) ? "park" : chance(rng, 0.12) ? "plaza" : "block";
+      blocks.push({ x: cx, z: cz, kind });
+      if (kind !== "block") continue;
+      const count = int(rng, 1, 3);
+      for (let i = 0; i < count; i++) {
+        const w = range(rng, 10, 20);
+        const d = range(rng, 10, 20);
+        const x = cx + range(rng, -8, 8) * (count > 1 ? 0.7 : 0);
+        const z = cz + range(rng, -8, 8) * (count > 1 ? 0.7 : 0);
+        buildings.push({
+          x,
+          z,
+          hw: w / 2,
+          hd: d / 2,
+          h: range(rng, 9, 42),
+          color: pick(rng, BUILDING_COLORS),
+        });
+      }
     }
   }
-  if (!prev.has(key(ti, tj))) return [];
+  // Road graph: one node per intersection, edges along every street.
   const nodes = [];
-  let cur = [ti, tj];
-  while (cur) {
-    nodes.unshift(cur);
-    cur = prev.get(key(cur[0], cur[1]));
+  for (let iz = 0; iz < 10; iz++) {
+    for (let ix = 0; ix < 10; ix++) {
+      nodes.push({ id: nodeId(ix, iz), ix, iz, x: STREETS[ix], z: STREETS[iz] });
+    }
   }
-  nodes.shift(); // drop the start node
-  return nodes.map(([i, j]) => ({ x: roadCoord(i), z: roadCoord(j), i, j }));
+  const edges = new Map();
+  for (const n of nodes) edges.set(n.id, []);
+  for (let iz = 0; iz < 10; iz++) {
+    for (let ix = 0; ix < 10; ix++) {
+      const id = nodeId(ix, iz);
+      if (ix < 9) edges.get(id).push(nodeId(ix + 1, iz));
+      if (ix > 0) edges.get(id).push(nodeId(ix - 1, iz));
+      if (iz < 9) edges.get(id).push(nodeId(ix, iz + 1));
+      if (iz > 0) edges.get(id).push(nodeId(ix, iz - 1));
+    }
+  }
+  return { seed, blocks, buildings, nodes, edges };
 }
 
-// Deterministic per-block flavour for the renderer: building height and
-// palette seed for block (bi, bj), bi/bj in 0..8.
-export function blockSeed(bi, bj) {
-  let h = (bi * 374761393 + bj * 668265263) ^ 0x9e3779b9;
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+// Breadth-first shortest path on the road graph. Returns node ids.
+export function bfs(city, fromId, toId) {
+  if (fromId === toId) return [fromId];
+  const prev = new Map([[fromId, -1]]);
+  const queue = [fromId];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const next of city.edges.get(cur) || []) {
+      if (prev.has(next)) continue;
+      prev.set(next, cur);
+      if (next === toId) {
+        const path = [toId];
+        let at = toId;
+        while (prev.get(at) !== -1) {
+          at = prev.get(at);
+          path.unshift(at);
+        }
+        return path;
+      }
+      queue.push(next);
+    }
+  }
+  return [fromId];
+}
+
+export function nearestNode(city, x, z) {
+  let best = city.nodes[0];
+  let bestD = Infinity;
+  for (const n of city.nodes) {
+    const d = (n.x - x) * (n.x - x) + (n.z - z) * (n.z - z);
+    if (d < bestD) {
+      bestD = d;
+      best = n;
+    }
+  }
+  return best;
+}
+
+// Snap a point to the nearest street centre line (roads run on the grid).
+export function nearestRoadPoint(x, z) {
+  let sx = STREETS[0];
+  let sz = STREETS[0];
+  for (const s of STREETS) {
+    if (Math.abs(s - x) < Math.abs(sx - x)) sx = s;
+    if (Math.abs(s - z) < Math.abs(sz - z)) sz = s;
+  }
+  if (Math.abs(sx - x) <= Math.abs(sz - z)) return { x: sx, z };
+  return { x, z: sz };
+}
+
+export function randomRoadPoint(rng) {
+  const s1 = pick(rng, STREETS);
+  const s2 = pick(rng, STREETS);
+  if (rng() < 0.5) return { x: s1, z: range(rng, -BOUND, BOUND) };
+  return { x: range(rng, -BOUND, BOUND), z: s2 };
+}
+
+// True when a point is inside any building footprint (with a margin).
+export function insideBuilding(city, x, z, margin = 0.6) {
+  for (const b of city.buildings) {
+    if (Math.abs(x - b.x) < b.hw + margin && Math.abs(z - b.z) < b.hd + margin) return b;
+  }
+  return null;
+}
+
+export function clampToCity(x, z) {
+  return {
+    x: Math.max(-BOUND - 6, Math.min(BOUND + 6, x)),
+    z: Math.max(-BOUND - 6, Math.min(330, z)),
+  };
+}
+
+export function onSand(z) {
+  return z > 244;
 }
