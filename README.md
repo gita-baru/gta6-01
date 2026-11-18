@@ -1,106 +1,44 @@
-# Solmar Heat
+# Solmar Heat — an open-world crime game in the browser
 
 [![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 [![rank](https://make.fun/badge/gta6-01/gita-baru/gta6-01/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 [![reward](https://make.fun/badge/gta6-01/gita-baru/gta6-01/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
-An open-world crime game in the spirit of GTA 6, built for make.fun's
-**gta6-01** bounty. It runs offline in a desktop browser from static files
-under `game/` — no build step, no network requests. Three.js is vendored
-under `game/vendor/`; every other line is original.
+Solmar Heat is a complete open-world crime game that runs entirely offline in a desktop browser. You are a wheelman new to Solmar City, a sun-soaked 9×9-block coastal city with a beach and an ocean to the south. Take jobs from fixer Lena Voss, steal cars, outrun the police, and climb from a $500 pickup to the $3,000 Heat Wave.
 
-## The game
+## What is in the game
 
-Solmar City is a sun-soaked coastal city: nine by nine blocks of towers,
-palms and neon, an ocean and a beach on its south edge. You are Marco, a
-getaway driver picking up work from Lena Voss, a fixer who calls you on the
-in-game phone.
-
-**Systems:** walk and drive anywhere in the city, steal any car, traffic
-and pedestrians who flee gunfire, a 5-star wanted level with police cruisers
-that route along the roads to chase you down (and a helicopter from 4 stars),
-five story missions, combat (fists and a pistol), a HUD with a live minimap,
-a day-to-sunset lighting cycle, synthesized sound plus a synth radio, and
-saves in localStorage.
-
-**Missions (from Lena Voss):**
-1. **First Pickup** — collect a package at the docks, deliver it to the Hotel Solmar. ($500)
-2. **Hot Wheels** — steal the yellow Comet GT uptown and bring it to the garage, with the police already on you. ($1,200)
-3. **The Getaway** — lose a 3-star wanted level and reach the safehouse in 90 seconds. ($2,000)
-4. **Night Run** — three deliveries across the city against a 150-second clock. ($1,500)
-5. **Heat Wave** — lose a 4-star wanted level with the helicopter up and reach the safehouse. ($3,000)
+- **A city to explore on foot and by car** — 9×9 blocks, traffic, pedestrians, a beach and the sea, a full day–sunset cycle.
+- **Driving with arcade physics** — acceleration, braking, handbrake drifts, and any car on the street can be stolen.
+- **A wanted system, 0–5 stars** — police chase you through the streets with BFS pathfinding and ramming; at 4+ stars a police helicopter joins the hunt.
+- **Five story missions** — First Pickup ($500), Hot Wheels ($1,200), The Getaway ($2,000), Night Run ($1,500) and Heat Wave ($3,000), with a live objective marker, distance readout and rewards.
+- **Combat** — fists and a pistol with limited ammo; pedestrians flee gunfire.
+- **A full HUD** — cash, wanted stars, health, speed, objective and distance, an in-game clock and a live minimap.
+- **Sound** — synthesized WebAudio engine, sirens and gunfire, plus a 3-station radio (R to change station, M to mute).
+- **Save** — progress is kept in localStorage.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
-| WASD / arrows | Walk / drive, steer |
+| WASD / arrows | Walk / drive |
 | Shift | Run |
-| E | Enter / exit car |
+| E | Enter / exit a car (steal it) |
 | F | Punch |
-| Mouse click | Shoot (on foot) |
-| Space | Handbrake (driving) / confirm (menus) |
-| T | Start the next job |
-| R | Toggle the radio |
+| Click | Shoot the pistol |
+| Space | Handbrake (drift) |
+| T | Start the next mission |
+| R | Change radio station |
 | M | Mute |
 | Esc | Pause |
-| Mouse | Orbit the camera (click to lock the pointer) |
 
 ## Run it
 
 ```sh
-node serve.ts          # serves game/ at http://localhost:8080
+node serve.ts
 ```
 
-Open http://localhost:8080 in desktop Chrome and press Start. Your progress
-saves automatically to localStorage.
-
-## Screenshots
-
-The four screenshots in `screenshots/` are real renders of the game,
-staged deterministically: `?shot=cover|street|mission|title` plays the
-simulation forward from a fixed seed with an autopilot, so the same seed
-always gives the same frame. See `shots.json`. The camera snaps to its final
-position before capture, so every frame is settled and readable: the chase
-cover shows the player at speed with police cruisers in pursuit, the street scene
-has traffic and pedestrians in frame, and the mission scene shows the hotel
-beacon with the objective distance.
-
-## Layout
-
-```
-main.ts                  entry program: copies game/ + screenshots/ to /output, writes dossier.json
-serve.ts                 tiny static server for local play
-vendor/makefun-game.ts   the kit's dossier library, unchanged
-game/
-  index.html             page, import map, HUD markup
-  style.css              HUD and menu styling
-  vendor/three.module.min.js   three.js r160, vendored
-  src/
-    main.js              boot, game loop, screens, shot staging
-    world.js             the simulation: player, cars, peds, police, missions, wanted
-    city.js              procedural Solmar City: blocks, roads, palms, named places
-    render.js            three.js scene: sky, sun, ocean, buildings, cars, people, camera
-    vehicles.js          arcade driving, traffic AI, police pursuit (BFS over the road grid)
-    player.js            on-foot movement and combat
-    peds.js              pedestrians who stroll and flee
-    missions.js          the five jobs from Lena Voss
-    wanted.js            wanted stars, police response, cooldown
-    hud.js               cash, stars, health, speed, objective, minimap, menus
-    audio.js             synthesized WebAudio: engine, sirens, gunshots, crashes, radio
-    input.js             keyboard and mouse
-    save.js              localStorage save/load
-    shots.js             deterministic screenshot scenes
-    config.js            tuning constants
-    random.js            seeded RNG
-tools/
-  shot.mjs               headless-Chromium screenshot driver (CDP)
-  simtest.mjs            headless smoke tests for the simulation core
-```
-
-## Entry
-
-Built for make.fun bounty **gta6-01** ("Make GTA 6"). License: MIT.
+Then open http://localhost:8080/ in desktop Chrome. No build step, no network: every file the game loads lives under `game/`, with Three.js r160 vendored at `game/vendor/three.min.js`.
 
 ---
 
