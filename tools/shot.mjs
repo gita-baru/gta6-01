@@ -1,148 +1,115 @@
-// Headless screenshot driver for Solmar Heat: launches the local Chromium
-// with the Hatch WebGL policy flags, opens a URL over CDP, optionally plays
-// scripted keys, waits for window.__shotReady (or a fixed delay), captures a
-// JPEG screenshot and prints console errors. No dependencies: Node 24's
-// global WebSocket and fetch talk to Chrome's DevTools protocol.
-//
-// (v2, 18 Nov 2026) Use the stock Chromium via SHOT_CHROME: the Hatch build
-// blocks localhost navigation, so the Playwright Chromium is the driver.
-//
-// Usage:
-//   node tools/shot.mjs --url "http://localhost:8080/?shot=cover" --out shots/1.jpg
-//   node tools/shot.mjs --url "http://localhost:8080/" --out shots/play.jpg \
-//     --keys "Enter:800,KeyW:3000" --wait 2500
+// Headless-Chromium screenshot driver over CDP (no dependencies — Node 24
+// has a global WebSocket client). Usage:
+//   SHOT_CHROME=/path/to/chrome node tools/shot.mjs --url <url> --out <file> [--wait ms] [--no-ready]
+// Waits for window.__shot.ready (unless --no-ready), then captures a JPEG and
+// reports the page's error count. Exits non-zero if errors > 0 or on timeout.
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-const CHROME = process.env.SHOT_CHROME || '/opt/meta-chromium/chrome';
-const POLICY = '/var/lib/hatch-browser/rootfs-base/usr/share/hatch/chromium/webgl-allowed-domains.txt';
-const POLICY_SHA = createHash('sha256').update(
-  (await import('node:fs')).readFileSync(POLICY),
-).digest('hex');
-const PORT = 9222;
+const CHROME = process.env.SHOT_CHROME
+  || '/home/hatch/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome';
 
-function parseArgs() {
-  const args = process.argv.slice(2);
-  const out = { width: 1280, height: 720, wait: 1500 };
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === '--url') out.url = args[++i];
-    else if (args[i] === '--out') out.out = args[++i];
-    else if (args[i] === '--width') out.width = Number(args[++i]);
-    else if (args[i] === '--height') out.height = Number(args[++i]);
-    else if (args[i] === '--wait') out.wait = Number(args[++i]);
-    else if (args[i] === '--keys') out.keys = args[++i];
-    else if (args[i] === '--eval') out.eval = args[++i];
-  }
-  if (!out.url || !out.out) {
-    console.error('usage: shot.mjs --url <url> --out <file.jpg> [--width 1280] [--height 720] [--wait ms] [--keys "Enter:800,KeyW:3000"] [--eval js]');
-    process.exit(2);
-  }
-  return out;
+const args = process.argv.slice(2);
+const opt = (name, def) => {
+  const i = args.indexOf(name);
+  return i >= 0 && args[i + 1] ? args[i + 1] : def;
+};
+const url = opt('--url');
+const out = opt('--out');
+const waitMs = parseInt(opt('--wait', '5000'), 10);
+const expectReady = !args.includes('--no-ready');
+const timeoutMs = parseInt(opt('--timeout', '45000'), 10);
+if (!url || !out) {
+  console.error('usage: node tools/shot.mjs --url <url> --out <file> [--wait ms] [--no-ready]');
+  process.exit(2);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const port = 9333;
+const profile = `/tmp/shot-profile-${process.pid}`;
 
-async function waitForChrome() {
-  for (let i = 0; i < 40; i += 1) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/json/version`);
-      if (res.ok) return;
-    } catch { /* not up yet */ }
-    await sleep(250);
-  }
-  throw new Error('chrome did not start');
-}
-
-const opts = parseArgs();
 const chrome = spawn(CHROME, [
-  '--headless=new', '--disable-gpu', '--use-angle=swiftshader', '--no-sandbox', '--disable-dev-shm-usage',
-  '--disable-features=LocalNetworkAccessChecks',
-  '--user-data-dir=/tmp/chrome-shot-profile',
-  `--hatch-webgl-allowed-domains-file=${POLICY}`,
-  `--hatch-webgl-allowed-domains-sha256=${POLICY_SHA}`,
-  `--remote-debugging-port=${PORT}`,
-  `--window-size=${opts.width},${opts.height}`,
-  opts.url,
+  '--headless=new', '--no-sandbox', '--disable-gpu',
+  '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-first-run', '--no-default-browser-check',
+  `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
+  '--window-size=1280,720', '--hide-scrollbars', 'about:blank',
 ], { stdio: 'ignore' });
 
-let exitCode = 0;
+async function getJson(path) {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`);
+  return res.json();
+}
+
+let ws = null;
+let msgId = 0;
+const pending = new Map();
+function send(method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = ++msgId;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+async function evaluate(expression) {
+  const res = await send('Runtime.evaluate', { expression, returnByValue: true });
+  return res?.result?.value;
+}
+
+let code = 0;
 try {
-  await waitForChrome();
-  const targets = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
-  const target = targets.find((t) => t.type === 'page');
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  // Wait for DevTools to answer.
+  let version = null;
+  for (let i = 0; i < 60; i++) {
+    try { version = await getJson('/json/version'); break; } catch { await sleep(500); }
+  }
+  if (!version) throw new Error('DevTools did not come up');
+
+  const targets = await getJson('/json/list');
+  const page = targets.find((t) => t.type === 'page');
+  if (!page) throw new Error('no page target');
+  ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     ws.onopen = resolve;
     ws.onerror = reject;
   });
-  let id = 0;
-  const pending = new Map();
-  const errors = [];
-  const send = (method, params) => new Promise((resolve) => {
-    const mid = ++id;
-    pending.set(mid, resolve);
-    ws.send(JSON.stringify({ id: mid, method, params: params || {} }));
-  });
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
     if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg.result || {});
+      pending.get(msg.id).resolve(msg.result);
       pending.delete(msg.id);
-    }
-    if (msg.method === 'Runtime.exceptionThrown') {
-      errors.push('EXCEPTION: ' + JSON.stringify(msg.params.exceptionDetails).slice(0, 500));
-    }
-    if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-      errors.push('CONSOLE: ' + msg.params.args.map((a) => a.value ?? a.description ?? '').join(' ').slice(0, 500));
-    }
-    if (msg.method === 'Network.loadingFailed') {
-      errors.push('NETFAIL: ' + (msg.params.errorText || ''));
     }
   };
   await send('Page.enable');
   await send('Runtime.enable');
-  await send('Network.enable');
-  await send('Emulation.setDeviceMetricsOverride', { width: opts.width, height: opts.height, deviceScaleFactor: 1, mobile: false });
-  await sleep(1200);
+  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
+  await send('Page.navigate', { url });
+  await sleep(1500);
 
-  // Scripted keys: "Enter:800,KeyW:3000" = press Enter, hold 800ms, then W for 3s.
-  if (opts.keys) {
-    for (const part of opts.keys.split(',')) {
-      const [code, holdMs] = part.split(':');
-      const hold = Number(holdMs || 300);
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', code, key: code.replace('Key', '').replace('Arrow', '').toLowerCase() || code });
-      await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', code, key: code.replace('Key', '').replace('Arrow', '').toLowerCase() || code });
-      await sleep(hold);
-      await send('Input.dispatchKeyEvent', { type: 'keyUp', code, key: code.replace('Key', '').replace('Arrow', '').toLowerCase() || code });
-      await sleep(150);
-    }
-  }
-
-  // Wait for the game's shot flag, or a fixed delay for live play.
   let ready = false;
-  for (let i = 0; i < 60; i += 1) {
-    const res = await send('Runtime.evaluate', { expression: 'window.__shotReady === true', returnByValue: true });
-    if (res.result && res.result.value === true) { ready = true; break; }
-    await sleep(250);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      ready = await evaluate('window.__shot && window.__shot.ready === true');
+    } catch { ready = false; }
+    if (ready || !expectReady) break;
+    await sleep(500);
   }
-  await sleep(opts.wait);
+  if (expectReady && !ready) throw new Error('timed out waiting for window.__shot.ready');
+  if (!expectReady) await sleep(waitMs);
 
-  if (opts.eval) {
-    const res = await send('Runtime.evaluate', { expression: opts.eval, returnByValue: true });
-    console.log('EVAL:', JSON.stringify(res.result?.value ?? res.result ?? res).slice(0, 1000));
-  }
-
+  const errors = (await evaluate('window.__shotErrors || 0')) ?? 0;
   const shot = await send('Page.captureScreenshot', { format: 'jpeg', quality: 82 });
-  if (!shot.data) throw new Error('no screenshot data');
-  writeFileSync(opts.out, Buffer.from(shot.data, 'base64'));
-  console.log(`saved ${opts.out} ready=${ready} errors=${errors.length}`);
-  for (const e of errors.slice(0, 10)) console.log('  ' + e);
-  ws.close();
+  const buf = Buffer.from(shot.data, 'base64');
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, buf);
+  console.log(JSON.stringify({ ready: !!ready, errors, out, bytes: buf.length }));
+  if (errors > 0) code = 1;
 } catch (err) {
-  console.error('FAILED:', err.message);
-  exitCode = 1;
+  console.error('shot failed:', err.message);
+  code = 1;
 } finally {
+  try { ws?.close(); } catch { /* ignore */ }
   chrome.kill('SIGKILL');
 }
-process.exit(exitCode);
+process.exit(code);
