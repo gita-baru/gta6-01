@@ -1,46 +1,75 @@
-<!doctype html>
-<!-- Solmar Heat (v2, 18 Nov 2026): page, import map, HUD markup. -->
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Solmar Heat — an open-world crime game</title>
-<link rel="stylesheet" href="./style.css">
+<title>Solmar Heat — open-world crime game</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.min.js" } }
 </script>
 </head>
 <body>
-<canvas id="game" aria-label="Solmar Heat: an open-world crime game in Solmar City"></canvas>
+<div id="game"></div>
+
 <div id="hud">
-  <div id="top-left">
-    <div id="objective"></div>
-    <div id="objective-dist"></div>
+  <div id="hud-top-left">
+    <div id="hud-cash">$250</div>
+    <div id="hud-stars">☆☆☆☆☆</div>
   </div>
-  <div id="top-right">
-    <div id="cash">$0</div>
-    <div id="stars">☆☆☆☆☆</div>
-    <div id="health"><div id="health-fill"></div></div>
-    <div id="clock">13:30</div>
+  <div id="hud-top-right">
+    <div id="hud-clock">17:12</div>
+    <div id="hud-ammo"></div>
   </div>
-  <canvas id="minimap" width="190" height="190"></canvas>
-  <div id="bottom-right">
-    <div id="speed"></div>
-    <div id="ammo"></div>
+  <div id="hud-objective">Press T to start the next job</div>
+  <div id="hud-toast"></div>
+  <div id="hud-bottom-left">
+    <div id="hud-health"><div id="hud-health-fill"></div></div>
   </div>
-  <div id="controls-hint">WASD move/drive · E enter car · F punch · Click shoot · Shift run · Space brake · T job · M mute · Esc pause</div>
-</div>
-<div id="banner" class="hidden"><div id="banner-title"></div><div id="banner-text"></div></div>
-<div id="toast" class="hidden"></div>
-<div id="menu" class="hidden">
-  <div id="menu-card">
-    <h1 id="menu-title"></h1>
-    <p id="menu-sub"></p>
-    <p id="menu-extra"></p>
-    <div id="menu-buttons"></div>
+  <div id="hud-bottom-right">
+    <div id="hud-speed">0 km/h</div>
+    <canvas id="minimap" width="180" height="180"></canvas>
   </div>
 </div>
-<p id="status" role="status" aria-live="polite"></p>
-<script type="module" src="./src/main.js"></script>
+
+<div id="screen-start" class="screen">
+  <div class="panel">
+    <h1>SOLMAR <span>HEAT</span></h1>
+    <p class="tagline">A sun-soaked open-world crime game in the browser.</p>
+    <p>You are Marco, a getaway driver. Lena Voss has work for you — five jobs,
+       the whole city, and every cop in Solmar on your tail.</p>
+    <p id="menu-progress"><span id="menu-cash">$250</span> · <span id="menu-missions">0 of 5 jobs done</span></p>
+    <button id="btn-start">▶ &nbsp;START GAME</button>
+    <p class="controls">WASD drive / walk · Shift run · E enter car · F punch · Click shoot<br>
+       Space handbrake · T next job · R radio · M mute · Esc pause</p>
+  </div>
+</div>
+
+<div id="screen-pause" class="screen hidden">
+  <div class="panel">
+    <h2>PAUSED</h2>
+    <p>Take a breath, Marco. The city waits.</p>
+    <button id="btn-resume">RESUME</button>
+  </div>
+</div>
+
+<div id="screen-busted" class="screen hidden">
+  <div class="panel">
+    <h2 class="red">BUSTED</h2>
+    <p>The Solmar PD caught up with you. $150 fine.</p>
+    <button id="btn-respawn-busted">BACK ON THE STREETS</button>
+  </div>
+</div>
+
+<div id="screen-wasted" class="screen hidden">
+  <div class="panel">
+    <h2 class="red">WASTED</h2>
+    <p>Marco is down. The hospital patches you up — minus $150.</p>
+    <button id="btn-respawn-wasted">BACK ON THE STREETS</button>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
 </body>
 </html>
