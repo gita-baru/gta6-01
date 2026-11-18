@@ -1,75 +1,67 @@
-// Pedestrians: they stroll the sidewalks, cross at corners, and run away
-// from gunshots, speeding cars and the player's fists.
-// (v2, 18 Nov 2026) Unchanged: the street scene stages them near the player.
-import { BLOCK, CITY_HALF, GRID, PITCH, ROAD } from './config.js';
-import { collideCircle } from './city.js';
+// Pedestrians: stroll the sidewalks, flee gunfire and speeding cars.
+import { CFG, dist2d } from './config.js';
+import { roadCoord, nearestNode } from './city.js';
 
-const SHIRTS = [0xe05040, 0x40a0e0, 0x50c060, 0xe0c040, 0x9050c0, 0xe0e0e0, 0x404040, 0xe08040];
-
-export function createPeds(rng, count) {
+export function spawnPeds(rng, count, avoid) {
   const peds = [];
-  for (let i = 0; i < count; i += 1) {
-    const bx = rng.int(0, GRID - 1);
-    const bz = rng.int(0, GRID - 1);
-    const x = -CITY_HALF + bx * PITCH + ROAD / 2 + rng.range(1, BLOCK - 1);
-    const z = -CITY_HALF + bz * PITCH + ROAD / 2 + rng.range(1, BLOCK - 1);
-    peds.push({
-      x, z,
+  for (let n = 0; n < count; n++) {
+    const i = rng.int(0, 9), j = rng.int(0, 9);
+    const ped = {
+      x: roadCoord(i) + rng.range(-8, 8),
+      z: roadCoord(j) + rng.range(-8, 8),
       heading: rng.range(0, Math.PI * 2),
-      speed: rng.range(1, 1.8),
-      shirt: SHIRTS[i % SHIRTS.length],
-      pants: 0x2a2f38,
-      targetX: x,
-      targetZ: z,
-      scared: 0,
-      walkPhase: rng.range(0, 6),
-      down: false,
-    });
+      speed: rng.range(CFG.pedSpeedMin, CFG.pedSpeedMax),
+      state: 'stroll', // 'stroll' | 'flee' | 'down'
+      downT: 0,
+      color: rng.pick([0xd94f4f, 0x4f7ad9, 0x53b06a, 0xd9b24f, 0x9a5fd0, 0xdddddd]),
+      axis: rng.chance(0.5) ? 'x' : 'z',
+      dir: rng.chance(0.5) ? 1 : -1,
+    };
+    if (avoid && dist2d(ped.x, ped.z, avoid.x, avoid.z) < 25) { n--; continue; }
+    peds.push(ped);
   }
   return peds;
 }
 
-export function stepPeds(peds, dt, buildings, threats, rng) {
+// gunfire: {x, z} of the latest shot, or null. threat: {x, z, speed} of the
+// player's car when it is moving fast nearby.
+export function stepPeds(peds, playerPos, gunfire, threat, dt) {
   for (const ped of peds) {
-    if (ped.down) continue;
-    // Fear: run away from the nearest threat.
-    let fleeX = 0;
-    let fleeZ = 0;
-    let nearest = Infinity;
-    for (const threat of threats) {
-      const dx = ped.x - threat.x;
-      const dz = ped.z - threat.z;
-      const dist = Math.hypot(dx, dz);
-      if (dist < threat.radius && dist < nearest) {
-        nearest = dist;
-        fleeX = dx / (dist || 1);
-        fleeZ = dz / (dist || 1);
+    if (ped.state === 'down') {
+      ped.downT -= dt;
+      if (ped.downT <= 0) { ped.state = 'flee'; }
+      continue;
+    }
+    let fleeFrom = null;
+    if (gunfire && dist2d(ped.x, ped.z, gunfire.x, gunfire.z) < 45) fleeFrom = gunfire;
+    else if (threat && threat.speed > 12 && dist2d(ped.x, ped.z, threat.x, threat.z) < 18) fleeFrom = threat;
+    else if (dist2d(ped.x, ped.z, playerPos.x, playerPos.z) < 2.5) fleeFrom = playerPos;
+    if (fleeFrom) ped.state = 'flee';
+    else if (ped.state === 'flee' && !fleeFrom) ped.state = 'stroll';
+
+    if (ped.state === 'flee' && fleeFrom) {
+      const away = Math.atan2(ped.x - fleeFrom.x, ped.z - fleeFrom.z);
+      ped.heading = away;
+      ped.x += Math.sin(away) * 5.5 * dt;
+      ped.z += Math.cos(away) * 5.5 * dt;
+    } else {
+      // Stroll along the nearest road, on the sidewalk edge.
+      const node = nearestNode(ped.x, ped.z);
+      if (ped.axis === 'x') {
+        ped.x += ped.dir * ped.speed * dt;
+        ped.z += (roadCoord(node.j) + 8.5 - ped.z) * Math.min(1, dt * 2);
+      } else {
+        ped.z += ped.dir * ped.speed * dt;
+        ped.x += (roadCoord(node.i) + 8.5 - ped.x) * Math.min(1, dt * 2);
+      }
+      if (Math.abs(ped.x) > CFG.cityMax + 12 || Math.abs(ped.z) > CFG.cityMax + 12) {
+        ped.x = roadCoord(node.i);
+        ped.z = roadCoord(node.j);
+        ped.axis = ped.axis === 'x' ? 'z' : 'x';
+        ped.dir = -ped.dir;
       }
     }
-    if (nearest < Infinity) {
-      ped.scared = 2.5;
-      ped.targetX = ped.x + fleeX * 30;
-      ped.targetZ = ped.z + fleeZ * 30;
-    }
-    ped.scared = Math.max(0, ped.scared - dt);
-    const dx = ped.targetX - ped.x;
-    const dz = ped.targetZ - ped.z;
-    const dist = Math.hypot(dx, dz);
-    if (dist < 1.5) {
-      // Pick a new stroll target on a nearby sidewalk.
-      const bx = Math.max(0, Math.min(GRID - 1, Math.floor((ped.x + CITY_HALF - ROAD / 2) / PITCH)));
-      const bz = Math.max(0, Math.min(GRID - 1, Math.floor((ped.z + CITY_HALF - ROAD / 2) / PITCH)));
-      ped.targetX = -CITY_HALF + bx * PITCH + ROAD / 2 + rng.range(1, BLOCK - 1);
-      ped.targetZ = -CITY_HALF + bz * PITCH + ROAD / 2 + rng.range(1, BLOCK - 1);
-    } else {
-      const speed = ped.scared > 0 ? 5.5 : ped.speed;
-      ped.heading = Math.atan2(dx, dz);
-      ped.x += (dx / dist) * speed * dt;
-      ped.z += (dz / dist) * speed * dt;
-      ped.walkPhase += speed * dt * 1.8;
-    }
-    const fixed = collideCircle(buildings, ped.x, ped.z, 0.4);
-    ped.x = fixed.x;
-    ped.z = fixed.z;
+    ped.x = Math.max(CFG.cityMin - 10, Math.min(CFG.cityMax + 10, ped.x));
+    ped.z = Math.max(CFG.cityMin - 10, Math.min(CFG.beachZ + 40, ped.z));
   }
 }

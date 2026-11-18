@@ -1,241 +1,187 @@
-// Boot and the one loop: input is read every frame, the world advances in
-// fixed 1/60 s steps, the renderer paints what is there and the HUD reports
-// it. Screens: title, play, paused, busted, wasted, and a mission-complete
-// card. ?shot=cover|street|mission|title (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady
-// for a screenshot.
-import { STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld } from './world.js';
-import {
-  ACTION_CONFIRM, ACTION_PAUSE, ACTION_START_MISSION, createInput,
-} from './input.js';
-import { createRenderer } from './render.js';
+// Solmar Heat — boot, game loop, screens, shot mode. Browser only.
+import { CFG } from './config.js';
+import { createWorld, stepWorld, respawn, playerPos } from './world.js';
+import { createRenderer, updateScene } from './render.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
+import { createInput } from './input.js';
+import { saveGame, loadGame, applySave } from './save.js';
+import { startMission, MISSIONS } from './missions.js';
 import { stageShot } from './shots.js';
-import { MISSIONS } from './missions.js';
 
-const MAX_FRAME = 0.25;
+window.__shotErrors = 0;
+window.addEventListener('error', () => { window.__shotErrors++; });
+window.addEventListener('unhandledrejection', () => { window.__shotErrors++; });
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const params = new URLSearchParams(location.search);
+const shotName = params.get('shot');
+const seed = parseInt(params.get('seed') || '7', 10);
 
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const renderer = createRenderer(canvas);
-const hud = createHud();
+const world = createWorld(seed);
+const saved = loadGame(window.localStorage);
+if (saved && !shotName) applySave(world, saved);
+
+const container = document.getElementById('game');
+const R = createRenderer(world, container);
+const hud = createHud(world);
 const audio = createAudio();
-const input = createInput(canvas);
-const world = createWorld(seed, renderer, hud, audio);
-world.reset(seed);
-void createRandom;
+const input = createInput(container);
 
-function resize() {
-  renderer.resize(window.innerWidth, window.innerHeight);
-}
-window.addEventListener('resize', resize);
-resize();
+let state = shotName ? 'shot' : 'title';
+let last = performance.now();
+let titleT = 0;
+let savedDone = world.stats.missionsDone;
 
-function announce(message) {
-  status.textContent = message;
-}
-
-function renderFrame() {
-  const focus = world.focus();
-  renderer.updateCamera(focus, world.state.camYaw, world.state.camPitch, world.cameraDistance(), 1 / 60);
-  renderer.updateParticles(1 / 60);
-  world.syncMeshes(1 / 60);
-  const target = world.missionTarget();
-  renderer.setBeacon(target ? target.x : 0, target ? target.z : 0, world.mission.active && !!target);
-  renderer.render();
+function showStateScreen() {
+  if (state === 'title') hud.showScreen('start');
+  else if (state === 'paused') hud.showScreen('pause');
+  else if (state === 'busted') hud.showScreen('busted');
+  else if (state === 'wasted') hud.showScreen('wasted');
+  else hud.hideScreens();
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  if (scene.screen === 'title') {
-    hud.showTitle(world.state.save, {
-      start: () => {},
-      continue: () => {},
-      help: () => {},
-    });
-  }
-  // Snap the chase camera to the staged angle before painting: the shot
-  // paints only two frames, and the camera's smoothing lerp would
-  // otherwise leave it a third of the way from its start position, so the
-  // frame would show the wrong angle and distance.
-  renderer.updateCamera(world.focus(), world.state.camYaw, world.state.camPitch, world.cameraDistance(), 1);
-  hud.update(world);
-  hud.drawMinimap(world);
-  let painted = 0;
-  function paint() {
-    renderFrame();
-    hud.update(world);
-    hud.drawMinimap(world);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  let screen = 'title';
-  let menuOpen = false;
-  let last = performance.now();
-  let accumulator = 0;
-
-  hud.showTitle(world.state.save, {
-    start: () => startGame(false),
-    continue: () => startGame(true),
-    help: () => hud.showHelp({ back: () => hud.showTitle(world.state.save, titleCallbacks()) }),
+document.getElementById('btn-start').addEventListener('click', () => {
+  audio.unlock();
+  state = 'playing';
+  hud.hideScreens();
+  hud.showToast(MISSIONS[world.missions.index].name + ' — press T to start the job', 5);
+});
+document.getElementById('btn-resume').addEventListener('click', () => {
+  state = 'playing';
+  hud.hideScreens();
+});
+for (const id of ['btn-respawn-busted', 'btn-respawn-wasted']) {
+  document.getElementById(id).addEventListener('click', () => {
+    respawn(world);
+    R.snapNext = true;
+    state = 'playing';
+    hud.hideScreens();
   });
+}
 
-  function titleCallbacks() {
-    return {
-      start: () => startGame(false),
-      continue: () => startGame(true),
-      help: () => hud.showHelp({ back: () => hud.showTitle(world.state.save, titleCallbacks()) }),
+function startPlaying() {
+  audio.unlock();
+  state = 'playing';
+  hud.hideScreens();
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  if (state === 'title') {
+    titleT += dt;
+    stepWorld(world, {}, dt);
+    const a = titleT * 0.045;
+    R.camOverride = {
+      pos: [Math.sin(a) * 200, 95, Math.cos(a) * 200 + 30],
+      look: [0, 12, 0],
     };
+    updateScene(R, world, dt, titleT);
+    R.renderer.render(R.scene, R.camera);
+    hud.update(dt);
+    return;
   }
 
-  function startGame(continued) {
-    if (!continued) {
-      world.reset(Math.floor(Math.random() * 4294967296));
-      world.state.save = null;
-      world.state.cash = 0;
+  if (state === 'paused' || state === 'busted' || state === 'wasted') {
+    updateScene(R, world, 0, now / 1000);
+    R.renderer.render(R.scene, R.camera);
+    return;
+  }
+
+  // playing
+  const mouse = input.takeMouse();
+  if (world.player.onFoot) {
+    world.camYaw += mouse.dx * 0.0026;
+  } else {
+    R.orbit += mouse.dx * 0.0026;
+  }
+  const inp = input.read(world.camYaw, world.player.onFoot);
+  inp.shoot = input.takeShoot();
+  if (inp.shoot) {
+    const fwd = { x: -Math.sin(world.camYaw), z: -Math.cos(world.camYaw) };
+    inp.aimHeading = Math.atan2(fwd.x, fwd.z);
+  }
+  inp.camYaw = world.camYaw;
+  stepWorld(world, inp, dt);
+
+  if (inp.mission) {
+    const ms = world.missions;
+    if (!ms.active && ms.index < MISSIONS.length) {
+      const def = startMission(world, ms.index);
+      hud.showToast(def.brief, 6);
+      audio.unlock();
+    } else if (ms.failed) {
+      startMission(world, ms.index);
+      hud.showToast('Retrying: ' + MISSIONS[ms.index].name, 4);
     }
-    audio.unlock();
-    hud.hideMenu();
-    menuOpen = false;
-    screen = 'play';
-    world.state.screen = 'play';
-    announce('Playing. Follow the yellow marker. Press T for a job.');
-    hud.toast('Welcome to Solmar City. Press T to take a job from Lena.', 5);
+  }
+  if (inp.mute) {
+    const muted = audio.toggleMute();
+    hud.showToast(muted ? 'Sound muted' : 'Sound on', 2);
+  }
+  if (inp.radio) {
+    const on = audio.toggleRadio();
+    hud.showToast(on ? `Radio on — ${audio.stationName()}` : 'Radio off', 3);
+  }
+  if (inp.pause) {
+    state = 'paused';
+    saveGame(window.localStorage, world);
+    showStateScreen();
+  }
+  if (world.busted) { state = 'busted'; showStateScreen(); }
+  if (world.wasted) { state = 'wasted'; showStateScreen(); }
+  if (world.stats.missionsDone > savedDone) {
+    savedDone = world.stats.missionsDone;
+    saveGame(window.localStorage, world);
+    hud.showToast(world.missions.message, 5);
   }
 
-  function openMissionComplete(mission) {
-    menuOpen = true;
-    hud.showMissionComplete(mission, {
-      next: () => {
-        hud.hideMenu();
-        menuOpen = false;
-      },
-    });
+  audio.update(world, dt);
+  updateScene(R, world, dt, now / 1000);
+  R.renderer.render(R.scene, R.camera);
+  hud.update(dt);
+}
+
+// --- Shot mode: stage deterministically, snap the camera, signal ready. ---
+if (shotName) {
+  const staged = stageShot(world, shotName);
+  if (staged.fov) {
+    R.camera.fov = staged.fov;
+    R.camera.updateProjectionMatrix();
   }
-
-  function endGame(kind) {
-    screen = kind;
-    world.state.screen = kind;
-    const stats = { cash: Math.floor(world.cash), jobs: world.mission.done.length };
-    hud.showEnd(kind, stats, {
-      retry: () => startGame(false),
-      quit: () => {
-        screen = 'title';
-        world.state.screen = 'title';
-        hud.showTitle(world.state.save, titleCallbacks());
-      },
-    });
-    announce(kind === 'busted' ? 'Busted.' : 'Wasted.');
+  const stepInput = { camYaw: world.camYaw, ...(staged.input || {}) };
+  for (let i = 0; i < staged.steps; i++) {
+    stepWorld(world, stepInput, 1 / 60);
   }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_START_MISSION && screen === 'play' && !world.mission.active) {
-      const mission = world.startMission();
-      if (mission) {
-        hud.bannerCall('📱 ' + mission.name, mission.intro, 7);
-        audio.unlock();
-      }
-    }
-    if (actions & ACTION_CONFIRM && screen === 'title' && !menuOpen) startGame(false);
-    if (actions & ACTION_PAUSE && screen === 'play' && !menuOpen) {
-      screen = 'paused';
-      menuOpen = true;
-      hud.showPause({
-        resume: () => {
-          hud.hideMenu();
-          menuOpen = false;
-          screen = 'play';
-        },
-        restart: () => startGame(false),
-        quit: () => {
-          hud.hideMenu();
-          menuOpen = false;
-          screen = 'title';
-          world.state.screen = 'title';
-          hud.showTitle(world.state.save, titleCallbacks());
-        },
-      });
-    }
-    return actions;
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    const dt = Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    const actions = handleActions();
-    if (screen === 'play' && !menuOpen) {
-      accumulator += dt;
-      while (accumulator >= STEP) {
-        const event = world.step(STEP, input, actions);
-        accumulator -= STEP;
-        if (event === 'busted') {
-          endGame('busted');
-          break;
-        }
-        if (event === 'wasted') {
-          endGame('wasted');
-          break;
-        }
-        if (event === 'mission-done') {
-          const doneId = world.mission.done[world.mission.done.length - 1];
-          const doneMission = MISSIONS.find((m) => m.id === doneId) || { name: doneId, reward: 0 };
-          openMissionComplete(doneMission);
-          break;
-        }
-      }
-    } else if (screen === 'title') {
-      accumulator += dt;
-      while (accumulator >= STEP) {
-        world.step(STEP, input, 0);
-        accumulator -= STEP;
-      }
-    }
-    hud.tick(dt);
-    hud.update(world);
-    hud.drawMinimap(world);
-    renderFrame();
-  }
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === 'play' && !menuOpen) {
-      screen = 'paused';
-      menuOpen = true;
-      hud.showPause({
-        resume: () => {
-          hud.hideMenu();
-          menuOpen = false;
-          screen = 'play';
-        },
-        restart: () => startGame(false),
-        quit: () => {
-          hud.hideMenu();
-          menuOpen = false;
-          screen = 'title';
-          world.state.screen = 'title';
-          hud.showTitle(world.state.save, titleCallbacks());
-        },
-      });
-    }
-  });
-
-  announce('Solmar Heat. Press Enter or click Start to play.');
+  updateScene(R, world, 0, 1);
+  R.camOverride = staged.cameraFor(world);
+  updateScene(R, world, 0, 1);
+  R.renderer.render(R.scene, R.camera);
+  hud.update(0);
+  if (shotName === 'title') hud.showScreen('start');
+  else hud.hideScreens();
+  // One more render after the HUD settles, then signal ready.
+  R.renderer.render(R.scene, R.camera);
+  window.__shot = { ready: true, errors: window.__shotErrors, name: shotName };
+} else {
+  showStateScreen();
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+window.addEventListener('keydown', (e) => {
+  if ((e.code === 'Enter' || e.code === 'Space') && state === 'title') startPlaying();
+  if ((e.code === 'Enter' || e.code === 'Space') && (state === 'busted' || state === 'wasted')) {
+    respawn(world);
+    R.snapNext = true;
+    state = 'playing';
+    hud.hideScreens();
+  }
+});
+
+window.addEventListener('resize', () => {
+  R.camera.aspect = container.clientWidth / container.clientHeight;
+  R.camera.updateProjectionMatrix();
+  R.renderer.setSize(container.clientWidth, container.clientHeight);
+});

@@ -1,40 +1,65 @@
-// The wanted level: stars the player earns by committing crimes, police cars
-// that arrive to match them, and a slow cooldown when the player lays low.
-// (v2, 18 Nov 2026) Unchanged: 3 stars still fields 2 cruisers, as the cover shows.
-import { MAX_WANTED, WANTED_DECAY_SECONDS } from './config.js';
+// Wanted level: stars, heat, police response, cooldown, bust/wasted checks.
+import { CFG, dist2d } from './config.js';
+import { makeCar } from './vehicles.js';
+import { nearestRoadPoint } from './city.js';
 
-export function createWanted() {
+export function makeWanted() {
   return {
-    level: 0,
-    quietTimer: 0,
-    decayTimer: 0,
+    stars: 0,
+    heat: 0,            // continuous heat; stars = ceil(heat)
+    lastCrime: -999,    // world time of the last crime
+    bustT: 0,           // how long police have been right on top of the player
   };
 }
 
-export function addCrime(wanted, stars) {
-  wanted.level = Math.min(MAX_WANTED, wanted.level + stars);
-  wanted.quietTimer = 0;
-  wanted.decayTimer = 0;
+export function addCrime(world, amount) {
+  const w = world.wanted;
+  w.heat = Math.min(CFG.maxStars, w.heat + amount);
+  w.stars = Math.max(w.stars, Math.ceil(w.heat));
+  w.lastCrime = world.time;
 }
 
-/** How many police cars the current level fields. */
-export function policeCount(level) {
-  if (level <= 0) return 0;
-  if (level <= 2) return 1;
-  if (level <= 3) return 2;
-  return 3;
+export function setWanted(world, stars) {
+  world.wanted.stars = stars;
+  world.wanted.heat = stars;
+  world.wanted.lastCrime = world.time;
 }
 
-export function updateWanted(wanted, dt, policeNear) {
-  if (wanted.level <= 0) return;
-  wanted.quietTimer += dt;
-  if (wanted.quietTimer > WANTED_DECAY_SECONDS && !policeNear) {
-    wanted.decayTimer += dt;
-    if (wanted.decayTimer > 12) {
-      wanted.level -= 1;
-      wanted.decayTimer = 0;
+// Keep the number of police cruisers in step with the stars; spawn them a
+// couple of blocks away so they drive in instead of popping up on screen.
+export function updateWanted(world, dt) {
+  const w = world.wanted;
+  // Heat decays only when the player has been clean for a while and no
+  // police car is close; the helicopter at 4+ stars blocks the cooldown.
+  const heliUp = w.stars >= CFG.heliStars;
+  const policeNear = world.police.some((c) => dist2d(c.x, c.z, world.player.x, world.player.z) < 60);
+  if (world.time - w.lastCrime > CFG.heatDecayDelay && !policeNear && !heliUp && w.heat > 0) {
+    w.heat = Math.max(0, w.heat - CFG.heatDecayRate * dt);
+    w.stars = Math.ceil(w.heat);
+  }
+  const want = w.stars;
+  while (world.police.length < want) {
+    const p = world.player;
+    const spot = nearestRoadPoint(p.x + (world.rng.chance(0.5) ? 90 : -90), p.z + (world.rng.chance(0.5) ? 90 : -90));
+    const car = makeCar(world.rng, 'police', spot.x, spot.z, world.rng.range(0, Math.PI * 2));
+    car.speed = 12;
+    world.police.push(car);
+  }
+  while (world.police.length > want) world.police.pop();
+  world.heli.active = w.stars >= CFG.heliStars;
+
+  // Busted: a cruiser sits on the player while on foot.
+  const p = world.player;
+  if (p.onFoot && w.stars > 0) {
+    const close = world.police.some((c) => dist2d(c.x, c.z, p.x, p.z) < CFG.bustDist && c.speed < 6);
+    if (close) {
+      w.bustT += dt;
+      if (w.bustT > CFG.bustTime) world.busted = true;
+    } else {
+      w.bustT = Math.max(0, w.bustT - dt * 2);
     }
   } else {
-    wanted.decayTimer = 0;
+    w.bustT = 0;
   }
+  if (p.health <= 0) world.wasted = true;
 }

@@ -1,110 +1,86 @@
-// Keyboard and mouse input. Keys are read as a held set every frame; actions
-// (enter car, punch, shoot, pause, confirm, mute) are edge-triggered and
-// consumed once through takeActions().
-// (v2, 18 Nov 2026) Unchanged: the same keys drive the live-play tests.
-export const ACTION_ENTER = 1;
-export const ACTION_PUNCH = 2;
-export const ACTION_SHOOT = 4;
-export const ACTION_PAUSE = 8;
-export const ACTION_CONFIRM = 16;
-export const ACTION_MUTE = 32;
-export const ACTION_START_MISSION = 64;
-
-const KEY_ACTIONS = {
-  KeyE: ACTION_ENTER,
-  KeyF: ACTION_PUNCH,
-  Escape: ACTION_PAUSE,
-  Enter: ACTION_CONFIRM,
-  Space: ACTION_CONFIRM,
-  KeyM: ACTION_MUTE,
-  KeyT: ACTION_START_MISSION,
-};
-
-export function createInput(canvas) {
-  const held = new Set();
-  let queued = 0;
-  let mouseDown = false;
+// Keyboard and mouse. Reads into a plain input object the simulation eats.
+// Browser only.
+export function createInput(canvasContainer) {
+  const keys = new Set();
   let mouseDX = 0;
   let mouseDY = 0;
-  let pointerLocked = false;
+  let shootQueued = false;
+  let locked = false;
 
-  function onKeyDown(event) {
-    if (event.repeat) return;
-    held.add(event.code);
-    const action = KEY_ACTIONS[event.code];
-    if (action) queued |= action;
-    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.code)) event.preventDefault();
-  }
-
-  function onKeyUp(event) {
-    held.delete(event.code);
-  }
-
-  function onMouseMove(event) {
-    if (pointerLocked) {
-      mouseDX += event.movementX;
-      mouseDY += event.movementY;
+  const onKeyDown = (e) => {
+    if (e.repeat) return;
+    keys.add(e.code);
+    if (e.code === 'Space') e.preventDefault();
+  };
+  const onKeyUp = (e) => keys.delete(e.code);
+  const onMouseMove = (e) => {
+    if (!locked) return;
+    mouseDX += e.movementX || 0;
+    mouseDY += e.movementY || 0;
+  };
+  const onMouseDown = (e) => {
+    if (e.button !== 0) return;
+    if (!locked) {
+      canvasContainer.requestPointerLock?.();
+      return;
     }
-  }
-
-  function onMouseDown(event) {
-    if (event.button === 0) {
-      mouseDown = true;
-      queued |= ACTION_SHOOT;
-    }
-  }
-
-  function onMouseUp(event) {
-    if (event.button === 0) mouseDown = false;
-  }
-
-  function onClick() {
-    if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
-  }
-
-  function onLockChange() {
-    pointerLocked = document.pointerLockElement === canvas;
-  }
+    shootQueued = true;
+  };
+  const onLockChange = () => {
+    locked = document.pointerLockElement === canvasContainer || document.pointerLockElement === canvasContainer.firstChild;
+  };
 
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('mousemove', onMouseMove);
   window.addEventListener('mousedown', onMouseDown);
-  window.addEventListener('mouseup', onMouseUp);
-  window.addEventListener('pointerlockchange', onLockChange);
-  canvas.addEventListener('click', onClick);
+  document.addEventListener('pointerlockchange', onLockChange);
+
+  const edge = (code) => {
+    if (keys.has(code)) { keys.delete(code); return true; }
+    return false;
+  };
 
   return {
-    // -1/0/1 drive and steer from WASD or the arrow keys.
-    drive() {
-      const up = held.has('KeyW') || held.has('ArrowUp');
-      const down = held.has('KeyS') || held.has('ArrowDown');
-      return (up ? 1 : 0) - (down ? 1 : 0);
+    // Consume the accumulated mouse delta for this frame.
+    takeMouse() {
+      const dx = mouseDX, dy = mouseDY;
+      mouseDX = 0; mouseDY = 0;
+      return { dx, dy };
     },
-    steer() {
-      const left = held.has('KeyA') || held.has('ArrowLeft');
-      const right = held.has('KeyD') || held.has('ArrowRight');
-      return (left ? 1 : 0) - (right ? 1 : 0);
+    takeShoot() {
+      const s = shootQueued;
+      shootQueued = false;
+      return s;
     },
-    run() {
-      return held.has('ShiftLeft') || held.has('ShiftRight');
-    },
-    handbrake() {
-      return held.has('Space');
-    },
-    mouseDown() {
-      return mouseDown;
-    },
-    takeMouseDelta() {
-      const d = { x: mouseDX, y: mouseDY };
-      mouseDX = 0;
-      mouseDY = 0;
-      return d;
-    },
-    takeActions() {
-      const actions = queued;
-      queued = 0;
-      return actions;
+    // Build the per-frame input for the simulation. camYaw is the current
+    // camera yaw, used to make WASD camera-relative on foot.
+    read(camYaw, onFoot) {
+      const up = keys.has('KeyW') || keys.has('ArrowUp');
+      const down = keys.has('KeyS') || keys.has('ArrowDown');
+      const left = keys.has('KeyA') || keys.has('ArrowLeft');
+      const right = keys.has('KeyD') || keys.has('ArrowRight');
+      const fwd = { x: -Math.sin(camYaw), z: -Math.cos(camYaw) };
+      const rgt = { x: -fwd.z, z: fwd.x };
+      let mx = 0, mz = 0;
+      if (up) { mx += fwd.x; mz += fwd.z; }
+      if (down) { mx -= fwd.x; mz -= fwd.z; }
+      if (right) { mx += rgt.x; mz += rgt.z; }
+      if (left) { mx -= rgt.x; mz -= rgt.z; }
+      return {
+        mx, mz,
+        run: keys.has('ShiftLeft') || keys.has('ShiftRight'),
+        throttle: onFoot ? 0 : (up ? 1 : down ? -1 : 0),
+        steer: (left ? -1 : 0) + (right ? 1 : 0),
+        handbrake: keys.has('Space'),
+        enter: edge('KeyE'),
+        punch: edge('KeyF'),
+        mission: edge('KeyT'),
+        mute: edge('KeyM'),
+        radio: edge('KeyR'),
+        pause: edge('Escape'),
+        shoot: false, // filled in by main.js from takeShoot()
+      };
     },
   };
 }

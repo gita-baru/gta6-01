@@ -1,430 +1,380 @@
-// Three.js rendering: the sky, sun and ocean, the city meshes, the cars, the
-// people and the chase camera. The simulation never touches three.js; this
-// file only turns the world's state into a picture each frame.
-// (v2, 18 Nov 2026) Unchanged: the camera snap lives in main.js, not here.
+// Three.js scene for Solmar City. Builds the static city once, then syncs
+// meshes from the simulation state every frame. Browser only.
 import * as THREE from 'three';
-import { BEACH_Z, BLOCK, CITY_HALF, GRID, PITCH, ROAD } from './config.js';
+import { CFG, clamp, lerp } from './config.js';
+import { roadCoord, blockSeed, PLACES } from './city.js';
+import { currentTarget } from './missions.js';
 
-const SKY_SETS = [
-  { top: 0x7ec8f0, mid: 0xcfe8f5, low: 0xffe0b0, sun: 0xfff2c0, fog: 0xd8e8f0 }, // morning
-  { top: 0x3f8fd0, mid: 0x9fd4ef, low: 0xfff0c0, sun: 0xffffff, fog: 0xcfe4ee }, // noon
-  { top: 0x5a7fd0, mid: 0xf0b070, low: 0xffc070, sun: 0xffd890, fog: 0xf0c890 }, // golden hour
-  { top: 0x2a3a70, mid: 0xe07050, low: 0xff9040, sun: 0xff7030, fog: 0xd89070 }, // sunset
-];
-
-function skyTexture(top, mid, low) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 4;
-  canvas.height = 256;
-  const ctx = canvas.getContext('2d');
-  const gradient = ctx.createLinearGradient(0, 0, 0, 256);
-  gradient.addColorStop(0, `#${top.toString(16).padStart(6, '0')}`);
-  gradient.addColorStop(0.55, `#${mid.toString(16).padStart(6, '0')}`);
-  gradient.addColorStop(1, `#${low.toString(16).padStart(6, '0')}`);
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, 4, 256);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
+function canvasTexture(w, h, draw) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
 }
 
-function buildingTexture(baseColor, variant) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 128;
-  canvas.height = 256;
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = `#${baseColor.toString(16).padStart(6, '0')}`;
-  ctx.fillRect(0, 0, 128, 256);
-  const cols = variant === 0 ? 4 : variant === 1 ? 5 : 3;
-  const rows = variant === 0 ? 10 : variant === 1 ? 8 : 12;
-  for (let r = 0; r < rows; r += 1) {
-    for (let c = 0; c < cols; c += 1) {
-      const lit = ((r * 7 + c * 13 + variant * 5) % 9) === 0;
-      ctx.fillStyle = lit ? '#ffd890' : '#2a3540';
-      ctx.fillRect(10 + c * (108 / cols), 12 + r * (232 / rows), 108 / cols - 8, 232 / rows - 8);
+function buildingTexture() {
+  return canvasTexture(128, 256, (g, w, h) => {
+    g.fillStyle = '#c8ccd2'; g.fillRect(0, 0, w, h);
+    for (let y = 12; y < h - 12; y += 22) {
+      for (let x = 10; x < w - 10; x += 20) {
+        g.fillStyle = Math.random() < 0.25 ? '#ffd27a' : '#2c3644';
+        g.fillRect(x, y, 12, 14);
+      }
     }
-  }
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
+  });
 }
 
-function groundTexture() {
-  const size = 1024;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  const worldSize = CITY_HALF * 2 + 130;
-  const toPx = (v) => ((v + worldSize / 2) / worldSize) * size;
-  // Sand base (beach shows at the south edge).
-  ctx.fillStyle = '#e8d5a0';
-  ctx.fillRect(0, 0, size, size);
-  // City ground.
-  ctx.fillStyle = '#b8b0a0';
-  ctx.fillRect(0, 0, size, toPx(BEACH_Z));
-  // Sidewalk blocks.
-  for (let bx = 0; bx < GRID; bx += 1) {
-    for (let bz = 0; bz < GRID; bz += 1) {
-      const x = -CITY_HALF + bx * PITCH + ROAD / 2;
-      const z = -CITY_HALF + bz * PITCH + ROAD / 2;
-      ctx.fillStyle = (bx + bz) % 2 ? '#c4bcae' : '#bcb4a6';
-      ctx.fillRect(toPx(x), toPx(z), toPx(x + BLOCK) - toPx(x), toPx(z + BLOCK) - toPx(z));
-    }
-  }
-  // Roads.
-  ctx.fillStyle = '#3a3f46';
-  for (let i = 0; i <= GRID; i += 1) {
-    const c = -CITY_HALF + i * PITCH;
-    ctx.fillRect(toPx(c - ROAD / 2), 0, toPx(c + ROAD / 2) - toPx(c - ROAD / 2), toPx(BEACH_Z));
-    ctx.fillRect(0, toPx(c - ROAD / 2), toPx(CITY_HALF), toPx(c + ROAD / 2) - toPx(c - ROAD / 2));
-  }
-  // Lane dashes.
-  ctx.fillStyle = '#e8d880';
-  for (let i = 0; i <= GRID; i += 1) {
-    const c = -CITY_HALF + i * PITCH;
-    for (let d = -CITY_HALF; d < CITY_HALF; d += 16) {
-      ctx.fillRect(toPx(c) - 1, toPx(d), 2, 6);
-      ctx.fillRect(toPx(d), toPx(c) - 1, 6, 2);
-    }
-  }
-  // Beach strip and water edge.
-  ctx.fillStyle = '#f0e0b0';
-  ctx.fillRect(0, toPx(BEACH_Z), size, toPx(BEACH_Z + 26) - toPx(BEACH_Z));
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = 4;
-  return texture;
+function roadTexture() {
+  const t = canvasTexture(64, 64, (g, w, h) => {
+    g.fillStyle = '#2e3138'; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#e8e8e8'; g.fillRect(w / 2 - 2, 6, 4, 22);
+    g.fillStyle = '#3a3e46'; g.fillRect(0, 0, 3, h); g.fillRect(w - 3, 0, 3, h);
+  });
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
 }
 
-export function createRenderer(canvas) {
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+const PALETTE = [0x8a7f72, 0x6b7a8a, 0x9a8a6a, 0x7a6a7a, 0x5a6a7a, 0x8a6a5a, 0x746a8a, 0x6a7a5a];
+
+export function createRenderer(world, container) {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  renderer.shadowMap.enabled = false;
+  container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0xd8e8f0, 120, 700);
-  const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 1500);
+  scene.background = new THREE.Color(0x87b5e0);
+  scene.fog = new THREE.Fog(0x9ab8d8, 220, 700);
 
-  const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x8a7a60, 0.9);
-  scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xfff2c0, 2.2);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -90;
-  sun.shadow.camera.right = 90;
-  sun.shadow.camera.top = 90;
-  sun.shadow.camera.bottom = -90;
-  sun.shadow.camera.far = 500;
-  sun.shadow.bias = -0.0004;
+  const camera = new THREE.PerspectiveCamera(62, container.clientWidth / container.clientHeight, 0.1, 1200);
+  camera.position.set(0, 30, 60);
+
+  const sun = new THREE.DirectionalLight(0xffe0b0, 2.4);
+  sun.position.set(120, 90, 60);
   scene.add(sun);
-  scene.add(sun.target);
+  const hemi = new THREE.HemisphereLight(0xbfd8ff, 0x5a4a3a, 0.9);
+  scene.add(hemi);
 
-  // Sky dome with a vertical gradient; the sun disc is a small emissive circle.
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(900, 24, 16),
-    new THREE.MeshBasicMaterial({ map: skyTexture(0x7ec8f0, 0xcfe8f5, 0xffe0b0), side: THREE.BackSide, fog: false }),
-  );
-  scene.add(sky);
-  const sunDisc = new THREE.Mesh(
-    new THREE.CircleGeometry(34, 24),
-    new THREE.MeshBasicMaterial({ color: 0xfff2c0, fog: false }),
-  );
-  scene.add(sunDisc);
-
-  // Ground: one textured plane for the whole city, beach and sand.
-  const worldSize = CITY_HALF * 2 + 130;
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(worldSize, worldSize),
-    new THREE.MeshLambertMaterial({ map: groundTexture() }),
-  );
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.set(0, 0, (BEACH_Z - CITY_HALF) / 2 + 10);
-  ground.receiveShadow = true;
-  scene.add(ground);
-
-  // Ocean plane south of the beach.
+  // --- Ground: city slab, roads, beach, ocean ---
+  const slab = new THREE.Mesh(
+    new THREE.PlaneGeometry(560, 560),
+    new THREE.MeshLambertMaterial({ color: 0x8f8f86 }));
+  slab.rotation.x = -Math.PI / 2; slab.position.set(0, 0, 0);
+  scene.add(slab);
+  const roadTex = roadTexture();
+  const roadMat = new THREE.MeshLambertMaterial({ map: roadTex });
+  for (let i = 0; i < 10; i++) {
+    for (const vertical of [true, false]) {
+      const len = 480;
+      const geo = new THREE.PlaneGeometry(vertical ? 12 : len, vertical ? len : 12);
+      const m = new THREE.Mesh(geo, roadMat.clone());
+      m.material.map = roadTex.clone();
+      m.material.map.repeat.set(vertical ? 1 : len / 16, vertical ? len / 16 : 1);
+      m.material.map.needsUpdate = true;
+      m.rotation.x = -Math.PI / 2;
+      m.position.set(vertical ? roadCoord(i) : 0, 0.05, vertical ? 0 : roadCoord(i));
+      scene.add(m);
+    }
+  }
+  const beach = new THREE.Mesh(
+    new THREE.PlaneGeometry(560, 60),
+    new THREE.MeshLambertMaterial({ color: 0xd9c08a }));
+  beach.rotation.x = -Math.PI / 2; beach.position.set(0, 0.04, 268);
+  scene.add(beach);
   const ocean = new THREE.Mesh(
-    new THREE.PlaneGeometry(1200, 500),
-    new THREE.MeshLambertMaterial({ color: 0x2a7ab0 }),
-  );
-  ocean.rotation.x = -Math.PI / 2;
-  ocean.position.set(0, -0.4, BEACH_Z + 26 + 250);
+    new THREE.PlaneGeometry(1400, 700),
+    new THREE.MeshPhongMaterial({ color: 0x1a6f8f, shininess: 120, transparent: true, opacity: 0.94 }));
+  ocean.rotation.x = -Math.PI / 2; ocean.position.set(0, 0.02, 640);
   scene.add(ocean);
 
-  const buildingMats = new Map();
-  function buildingMaterial(color, variant) {
-    const key = `${color}-${variant}`;
-    if (!buildingMats.has(key)) {
-      buildingMats.set(key, new THREE.MeshLambertMaterial({ map: buildingTexture(color, variant) }));
-    }
-    return buildingMats.get(key);
-  }
-  const roofMat = new THREE.MeshLambertMaterial({ color: 0x707880 });
-  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-  const trunkGeo = new THREE.CylinderGeometry(0.18, 0.28, 5, 6);
-  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8a6a4a });
-  const frondGeo = new THREE.ConeGeometry(1.6, 3.2, 4);
-  const frondMat = new THREE.MeshLambertMaterial({ color: 0x3a8a4a });
-  const lampPoleGeo = new THREE.CylinderGeometry(0.09, 0.09, 6, 6);
-  const lampPoleMat = new THREE.MeshLambertMaterial({ color: 0x404850 });
-  const lampHeadGeo = new THREE.SphereGeometry(0.28, 8, 6);
-  const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffe8a0 });
-
-  const dynamic = new Map(); // id -> { group, wheels, steer, lightRed, lightBlue, legs }
-  const beacon = new THREE.Mesh(
-    new THREE.CylinderGeometry(2.2, 2.2, 60, 16, 1, true),
-    new THREE.MeshBasicMaterial({ color: 0xffd040, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false }),
-  );
-  beacon.visible = false;
-  scene.add(beacon);
-  const beaconDiamond = new THREE.Mesh(
-    new THREE.OctahedronGeometry(1.1),
-    new THREE.MeshBasicMaterial({ color: 0xffd040 }),
-  );
-  beaconDiamond.visible = false;
-  scene.add(beaconDiamond);
-
-  // Simple particle pool for dust, sparks and muzzle flashes.
-  const PARTICLE_MAX = 240;
-  const particleGeo = new THREE.BufferGeometry();
-  const particlePos = new Float32Array(PARTICLE_MAX * 3);
-  particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePos, 3));
-  const particleMat = new THREE.PointsMaterial({ color: 0xffd080, size: 0.9, transparent: true, opacity: 0.9 });
-  const particles = new THREE.Points(particleGeo, particleMat);
-  particles.frustumCulled = false;
-  scene.add(particles);
-  const particleLife = new Float32Array(PARTICLE_MAX);
-  const particleVel = new Float32Array(PARTICLE_MAX * 3);
-  let particleCursor = 0;
-
-  function spawnParticles(x, y, z, count, spread, up) {
-    for (let i = 0; i < count; i += 1) {
-      const idx = particleCursor;
-      particleCursor = (particleCursor + 1) % PARTICLE_MAX;
-      particlePos[idx * 3] = x;
-      particlePos[idx * 3 + 1] = y;
-      particlePos[idx * 3 + 2] = z;
-      particleVel[idx * 3] = (Math.random() - 0.5) * spread;
-      particleVel[idx * 3 + 1] = Math.random() * up;
-      particleVel[idx * 3 + 2] = (Math.random() - 0.5) * spread;
-      particleLife[idx] = 0.5 + Math.random() * 0.4;
-    }
-    particleGeo.attributes.position.needsUpdate = true;
-  }
-
-  function buildCity(city) {
-    for (const b of city.buildings) {
-      const mesh = new THREE.Mesh(boxGeo, buildingMaterial(b.color, b.variant));
-      mesh.scale.set(b.w, b.h, b.d);
-      mesh.position.set(b.x + b.w / 2, b.h / 2, b.z + b.d / 2);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      scene.add(mesh);
-      const roof = new THREE.Mesh(boxGeo, roofMat);
-      roof.scale.set(b.w + 0.4, 0.5, b.d + 0.4);
-      roof.position.set(b.x + b.w / 2, b.h + 0.25, b.z + b.d / 2);
-      scene.add(roof);
-    }
-    for (const p of city.palms) {
-      const trunk = new THREE.Mesh(trunkGeo, trunkMat);
-      trunk.position.set(p.x, 2.5, p.z);
-      trunk.castShadow = true;
-      scene.add(trunk);
-      for (let f = 0; f < 6; f += 1) {
-        const frond = new THREE.Mesh(frondGeo, frondMat);
-        frond.position.set(p.x, 5.4, p.z);
-        frond.rotation.z = Math.PI / 2.6;
-        frond.rotation.y = (f / 6) * Math.PI * 2;
-        frond.scale.set(1, 1, 0.35);
-        scene.add(frond);
+  // --- Buildings: one or two per block, taller toward the centre ---
+  const bTex = buildingTexture();
+  const bGeo = new THREE.BoxGeometry(1, 1, 1);
+  bGeo.translate(0, 0.5, 0);
+  const bMats = PALETTE.map((c) => new THREE.MeshLambertMaterial({ color: c, map: bTex }));
+  for (let bi = 0; bi < 9; bi++) {
+    for (let bj = 0; bj < 9; bj++) {
+      const s = blockSeed(bi, bj);
+      const cx = roadCoord(bi) + 26, cz = roadCoord(bj) + 26;
+      const distC = Math.hypot(bi - 4, bj - 4) / 5.7;
+      const h1 = 8 + s * 26 * (1.25 - distC * 0.7);
+      const b1 = new THREE.Mesh(bGeo, bMats[(bi * 9 + bj) % bMats.length]);
+      b1.scale.set(22 + s * 8, h1, 22 + s * 8);
+      b1.position.set(cx - 6, 0, cz - 6);
+      scene.add(b1);
+      if (s > 0.45) {
+        const b2 = new THREE.Mesh(bGeo, bMats[(bi * 3 + bj * 7) % bMats.length]);
+        b2.scale.set(14, 6 + s * 14, 14);
+        b2.position.set(cx + 10, 0, cz + 10);
+        scene.add(b2);
       }
     }
-    for (const lamp of city.lamps) {
-      const pole = new THREE.Mesh(lampPoleGeo, lampPoleMat);
-      pole.position.set(lamp.x, 3, lamp.z);
-      scene.add(pole);
-      const head = new THREE.Mesh(lampHeadGeo, lampHeadMat);
-      head.position.set(lamp.x, 6.1, lamp.z);
-      scene.add(head);
-    }
   }
 
-  function makeCarMesh(color, sport, police) {
-    const group = new THREE.Group();
-    const bodyColor = police ? 0xf0f0f0 : color;
-    const bodyMat = new THREE.MeshLambertMaterial({ color: bodyColor });
-    const darkMat = new THREE.MeshLambertMaterial({ color: 0x1a2028 });
-    const body = new THREE.Mesh(boxGeo, bodyMat);
-    body.scale.set(sport ? 4.6 : 4.4, 0.75, 1.9);
-    body.position.y = 0.62;
-    body.castShadow = true;
-    group.add(body);
-    const cabin = new THREE.Mesh(boxGeo, darkMat);
-    cabin.scale.set(2.2, 0.62, 1.7);
-    cabin.position.set(-0.2, 1.28, 0);
-    cabin.castShadow = true;
-    group.add(cabin);
-    const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.3, 12);
-    const wheelMat = new THREE.MeshLambertMaterial({ color: 0x14181c });
-    const wheels = [];
-    const steer = [];
-    for (const [wx, wz] of [[1.45, 0.85], [1.45, -0.85], [-1.45, 0.85], [-1.45, -0.85]]) {
-      const pivot = new THREE.Group();
-      pivot.position.set(wx, 0.36, wz);
-      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-      wheel.rotation.x = Math.PI / 2;
-      pivot.add(wheel);
-      group.add(pivot);
-      wheels.push(wheel);
-      if (wx > 0) steer.push(pivot);
-    }
-    const lightMat = new THREE.MeshBasicMaterial({ color: 0xfff2b0 });
-    for (const wz of [0.6, -0.6]) {
-      const head = new THREE.Mesh(boxGeo, lightMat);
-      head.scale.set(0.12, 0.18, 0.3);
-      head.position.set(2.24, 0.66, wz);
-      group.add(head);
-    }
-    const tailMat = new THREE.MeshBasicMaterial({ color: 0xff2a20 });
-    for (const wz of [0.6, -0.6]) {
-      const tail = new THREE.Mesh(boxGeo, tailMat);
-      tail.scale.set(0.12, 0.18, 0.3);
-      tail.position.set(-2.24, 0.66, wz);
-      group.add(tail);
-    }
-    let lightRed = null;
-    let lightBlue = null;
-    if (police) {
-      const stripe = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x1a2a3a }));
-      stripe.scale.set(4.42, 0.2, 1.92);
-      stripe.position.y = 0.95;
-      group.add(stripe);
-      lightRed = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0xff2020 }));
-      lightRed.scale.set(0.5, 0.16, 0.5);
-      lightRed.position.set(-0.2, 1.66, 0.45);
-      group.add(lightRed);
-      lightBlue = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0x2040ff }));
-      lightBlue.scale.set(0.5, 0.16, 0.5);
-      lightBlue.position.set(-0.2, 1.66, -0.45);
-      group.add(lightBlue);
-    }
-    return { group, wheels, steer, lightRed, lightBlue };
+  // --- Palms along the roads ---
+  const trunkGeo = new THREE.CylinderGeometry(0.35, 0.5, 7, 6);
+  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x7a5a38 });
+  const leafGeo = new THREE.ConeGeometry(3.2, 3.4, 6);
+  const leafMat = new THREE.MeshLambertMaterial({ color: 0x3f7a3a });
+  const palmRng = (() => { let a = 1234567; return () => { a = (a * 1103515245 + 12345) & 0x7fffffff; return a / 0x7fffffff; }; })();
+  for (let n = 0; n < 90; n++) {
+    const i = Math.floor(palmRng() * 10);
+    const along = -230 + palmRng() * 460;
+    const side = palmRng() < 0.5 ? -9.5 : 9.5;
+    const x = palmRng() < 0.5 ? roadCoord(i) + side : along;
+    const z = palmRng() < 0.5 ? along : roadCoord(i) + side;
+    // Keep the plaza clear — it is the street-level staging area.
+    if (Math.hypot(x - PLACES.plaza.x, z - PLACES.plaza.z) < 26) continue;
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.position.set(x, 3.5, z);
+    scene.add(trunk);
+    const leaf = new THREE.Mesh(leafGeo, leafMat);
+    leaf.position.set(x, 8.2, z);
+    scene.add(leaf);
   }
 
-  function makePersonMesh(shirt, pants) {
-    const group = new THREE.Group();
-    const shirtMat = new THREE.MeshLambertMaterial({ color: shirt });
-    const pantsMat = new THREE.MeshLambertMaterial({ color: pants });
-    const skinMat = new THREE.MeshLambertMaterial({ color: 0xd8a080 });
-    const torso = new THREE.Mesh(boxGeo, shirtMat);
-    torso.scale.set(0.55, 0.75, 0.32);
-    torso.position.y = 1.15;
-    torso.castShadow = true;
-    group.add(torso);
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), skinMat);
-    head.position.y = 1.72;
-    head.castShadow = true;
-    group.add(head);
-    const legL = new THREE.Mesh(boxGeo, pantsMat);
-    legL.scale.set(0.2, 0.75, 0.2);
-    legL.position.set(0.14, 0.38, 0);
-    group.add(legL);
-    const legR = new THREE.Mesh(boxGeo, pantsMat);
-    legR.scale.set(0.2, 0.75, 0.2);
-    legR.position.set(-0.14, 0.38, 0);
-    group.add(legR);
-    const armL = new THREE.Mesh(boxGeo, shirtMat);
-    armL.scale.set(0.14, 0.6, 0.14);
-    armL.position.set(0.36, 1.15, 0);
-    group.add(armL);
-    const armR = new THREE.Mesh(boxGeo, shirtMat);
-    armR.scale.set(0.14, 0.6, 0.14);
-    armR.position.set(-0.36, 1.15, 0);
-    group.add(armR);
-    return { group, legL, legR, armL, armR };
-  }
-
-  const camState = { yaw: 0, pitch: 0.32, dist: 9 };
-
-  function resize(width, height) {
-    renderer.setSize(width, height, false);
-    camera.aspect = width / height;
-    camera.updateProjectionMatrix();
-  }
-
-  function setTimeOfDay(t) {
-    // t in [0,1]: 0 dawn, 0.5 noon, 1 dusk. Pick the nearest of four looks.
-    const set = SKY_SETS[Math.max(0, Math.min(3, Math.round(t * 3)))];
-    sky.material.map = skyTexture(set.top, set.mid, set.low);
-    sky.material.needsUpdate = true;
-    scene.fog.color.setHex(set.fog);
-    sun.color.setHex(set.sun);
-    sunDisc.material.color.setHex(set.sun);
-    const angle = Math.PI * (0.15 + t * 0.7);
-    const elevation = Math.sin(angle) * 0.9 + 0.15;
-    sun.position.set(Math.cos(angle) * 120, elevation * 160, -80);
-    sunDisc.position.set(Math.cos(angle) * 800, elevation * 700, -700);
-    sunDisc.lookAt(camera.position);
-    hemi.intensity = 0.55 + (1 - Math.abs(t - 0.5)) * 0.5;
-    sun.intensity = 2.4 - Math.abs(t - 0.5) * 1.2;
-  }
-
-  return {
-    scene,
-    camera,
-    buildCity,
-    makeCarMesh,
-    makePersonMesh,
-    resize,
-    setTimeOfDay,
-    spawnParticles,
-    dynamic,
-    setBeacon(x, z, visible) {
-      beacon.visible = visible;
-      beaconDiamond.visible = visible;
-      if (visible) {
-        beacon.position.set(x, 30, z);
-        beaconDiamond.position.set(x, 8 + Math.sin(performance.now() / 300) * 0.6, z);
-        beaconDiamond.rotation.y = performance.now() / 500;
-      }
-    },
-    updateParticles(dt) {
-      for (let i = 0; i < PARTICLE_MAX; i += 1) {
-        if (particleLife[i] <= 0) continue;
-        particleLife[i] -= dt;
-        particlePos[i * 3] += particleVel[i * 3] * dt;
-        particlePos[i * 3 + 1] += particleVel[i * 3 + 1] * dt;
-        particlePos[i * 3 + 2] += particleVel[i * 3 + 2] * dt;
-        particleVel[i * 3 + 1] -= 4 * dt;
-        if (particleLife[i] <= 0) particlePos[i * 3 + 1] = -100;
-      }
-      particleGeo.attributes.position.needsUpdate = true;
-    },
-    updateCamera(focus, yaw, pitch, dist, dt) {
-      camState.yaw += (yaw - camState.yaw) * Math.min(1, dt * 10);
-      camState.pitch += (pitch - camState.pitch) * Math.min(1, dt * 10);
-      camState.dist += (dist - camState.dist) * Math.min(1, dt * 5);
-      const cx = focus.x - Math.sin(camState.yaw) * Math.cos(camState.pitch) * camState.dist;
-      const cz = focus.z - Math.cos(camState.yaw) * Math.cos(camState.pitch) * camState.dist;
-      const cy = focus.y + Math.sin(camState.pitch) * camState.dist + 1.2;
-      camera.position.set(cx, Math.max(cy, 1.2), cz);
-      camera.lookAt(focus.x, focus.y + 1.4, focus.z);
-      // Shadows follow the action.
-      sun.position.set(focus.x + 90, 130, focus.z - 60);
-      sun.target.position.set(focus.x, 0, focus.z);
-      sun.target.updateMatrixWorld();
-    },
-    setCameraDirect(position, lookAt) {
-      camera.position.copy(position);
-      camera.lookAt(lookAt);
-      camState.yaw = Math.atan2(-(position.x - lookAt.x), -(position.z - lookAt.z));
-    },
-    render() {
-      renderer.render(scene, camera);
-    },
+  // --- Landmarks ---
+  const landmark = (geo, mat, x, y, z, ry = 0) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z); m.rotation.y = ry;
+    scene.add(m);
+    return m;
   };
+  // Hotel Solmar: tall gold tower with a rooftop sign.
+  const hotel = PLACES.hotel;
+  landmark(new THREE.BoxGeometry(30, 64, 30), new THREE.MeshLambertMaterial({ color: 0xc9a227, map: bTex }), hotel.x - 20, 32, hotel.z - 20);
+  landmark(new THREE.BoxGeometry(24, 4, 6), new THREE.MeshLambertMaterial({ color: 0xffe27a, emissive: 0xaa8822 }), hotel.x - 20, 66, hotel.z - 20);
+  // Docks: shipping containers.
+  const contCols = [0xb04030, 0x3050b0, 0x40a050, 0xc0a030];
+  const docks = PLACES.docks;
+  for (let n = 0; n < 6; n++) {
+    landmark(new THREE.BoxGeometry(10, 3.4, 3.4),
+      new THREE.MeshLambertMaterial({ color: contCols[n % 4] }),
+      docks.x - 30 + (n % 3) * 12, 1.7, docks.z + 14 + Math.floor(n / 3) * 6);
+  }
+  // Garage: low wide building. Safehouse: small house. Stadium: bowl.
+  const garage = PLACES.garage;
+  landmark(new THREE.BoxGeometry(26, 8, 18), new THREE.MeshLambertMaterial({ color: 0x5a6a7a, map: bTex }), garage.x - 18, 4, garage.z - 18);
+  const safe = PLACES.safehouse;
+  landmark(new THREE.BoxGeometry(12, 6, 10), new THREE.MeshLambertMaterial({ color: 0xd9c8a0 }), safe.x + 16, 3, safe.z - 16);
+  const stadium = PLACES.stadium;
+  landmark(new THREE.CylinderGeometry(26, 28, 12, 18), new THREE.MeshLambertMaterial({ color: 0x7a8a9a }), stadium.x + 20, 6, stadium.z + 20);
+  // Marina boats.
+  const marina = PLACES.marina;
+  for (let n = 0; n < 4; n++) {
+    landmark(new THREE.BoxGeometry(4, 1.6, 10), new THREE.MeshLambertMaterial({ color: 0xeeeeee }),
+      marina.x - 10 + n * 7, 0.8, 312 + (n % 2) * 10);
+  }
+
+  // --- Dynamic objects ---
+  const carGeo = new THREE.BoxGeometry(2.1, 0.75, 4.4);
+  const cabinGeo = new THREE.BoxGeometry(1.8, 0.65, 2.2);
+  const cabinMat = new THREE.MeshLambertMaterial({ color: 0x18202c });
+  const wheelGeo = new THREE.CylinderGeometry(0.42, 0.42, 0.35, 10);
+  const wheelMat = new THREE.MeshLambertMaterial({ color: 0x111111 });
+  const carGroups = new Map();
+  function carGroup(car) {
+    let g = carGroups.get(car);
+    if (g) return g;
+    g = new THREE.Group();
+    const bodyMat = new THREE.MeshLambertMaterial({ color: car.color });
+    const body = new THREE.Mesh(carGeo, bodyMat);
+    body.position.y = 0.55;
+    g.add(body);
+    const cabin = new THREE.Mesh(cabinGeo, cabinMat);
+    cabin.position.set(0, 1.15, -0.2);
+    g.add(cabin);
+    for (const [wx, wz] of [[-0.95, 1.4], [0.95, 1.4], [-0.95, -1.4], [0.95, -1.4]]) {
+      const w = new THREE.Mesh(wheelGeo, wheelMat);
+      w.rotation.z = Math.PI / 2;
+      w.position.set(wx, 0.42, wz);
+      g.add(w);
+    }
+    if (car.kind === 'police') {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.25, 0.5),
+        new THREE.MeshLambertMaterial({ color: 0xffffff, emissive: 0x880000 }));
+      bar.position.set(0, 1.6, -0.2);
+      bar.name = 'lightbar';
+      g.add(bar);
+      const roof = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.12, 2.0),
+        new THREE.MeshLambertMaterial({ color: 0xeeeeee }));
+      roof.position.set(0, 1.5, -0.2);
+      g.add(roof);
+    }
+    g.userData.bodyMat = bodyMat;
+    scene.add(g);
+    carGroups.set(car, g);
+    return g;
+  }
+
+  const pedGeo = new THREE.BoxGeometry(0.55, 1.1, 0.35);
+  const headGeo = new THREE.SphereGeometry(0.22, 8, 6);
+  const pedGroups = new Map();
+  function pedGroup(ped) {
+    let g = pedGroups.get(ped);
+    if (g) return g;
+    g = new THREE.Group();
+    const body = new THREE.Mesh(pedGeo, new THREE.MeshLambertMaterial({ color: ped.color }));
+    body.position.y = 0.85;
+    g.add(body);
+    const head = new THREE.Mesh(headGeo, new THREE.MeshLambertMaterial({ color: 0xd9a986 }));
+    head.position.y = 1.6;
+    g.add(head);
+    scene.add(g);
+    pedGroups.set(ped, g);
+    return g;
+  }
+
+  // Helicopter.
+  const heli = new THREE.Group();
+  const heliBody = new THREE.Mesh(new THREE.BoxGeometry(3.4, 1.6, 7),
+    new THREE.MeshLambertMaterial({ color: 0x223344 }));
+  heliBody.position.y = 0;
+  heli.add(heliBody);
+  const heliTail = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 5),
+    new THREE.MeshLambertMaterial({ color: 0x223344 }));
+  heliTail.position.set(0, 0.2, -5);
+  heli.add(heliTail);
+  const rotor = new THREE.Mesh(new THREE.BoxGeometry(11, 0.12, 0.7),
+    new THREE.MeshLambertMaterial({ color: 0x111111 }));
+  rotor.position.y = 1.1;
+  heli.add(rotor);
+  const search = new THREE.Mesh(new THREE.ConeGeometry(6, 30, 12, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xfff2aa, transparent: true, opacity: 0.12, side: THREE.DoubleSide }));
+  search.position.y = -16;
+  search.rotation.x = Math.PI;
+  heli.add(search);
+  scene.add(heli);
+
+  // Mission beacon: glowing column + pulsing ground ring.
+  const beacon = new THREE.Group();
+  const column = new THREE.Mesh(new THREE.CylinderGeometry(1.6, 1.6, 60, 12, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xffd21a, transparent: true, opacity: 0.35, side: THREE.DoubleSide }));
+  column.position.y = 30;
+  beacon.add(column);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(2.4, 3.6, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffd21a, transparent: true, opacity: 0.8, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.12;
+  beacon.add(ring);
+  scene.add(beacon);
+
+  // Player marker: a small ring under Marco when he is on foot.
+  const playerRing = new THREE.Mesh(new THREE.RingGeometry(0.9, 1.25, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
+  playerRing.rotation.x = -Math.PI / 2;
+  playerRing.position.y = 0.1;
+  scene.add(playerRing);
+
+  const state = {
+    renderer, scene, camera, sun, hemi,
+    carGroups, pedGroups, heli, beacon, rotor, playerRing,
+    makeCarGroup: carGroup, makePedGroup: pedGroup,
+    orbit: 0,            // temporary mouse orbit offset while driving
+    camOverride: null,   // {pos, look} for staged screenshots
+    snapNext: false,
+  };
+  return state;
+}
+
+const SKY_DAY = new THREE.Color(0x87b5e0);
+const SKY_SET = new THREE.Color(0xff9a56);
+const SKY_NIGHT = new THREE.Color(0x0b1026);
+const tmpColor = new THREE.Color();
+
+export function updateScene(R, world, dt, time) {
+  // --- Day cycle lighting ---
+  const sunEl = Math.sin(world.dayT * Math.PI * 2); // >0 day, <0 night
+  const sunAz = Math.cos(world.dayT * Math.PI * 2);
+  R.sun.position.set(sunAz * 160, Math.max(8, sunEl * 160), 80);
+  R.sun.intensity = clamp(sunEl * 3.0, 0.15, 3.0);
+  R.sun.color.setHSL(0.08, 0.7, clamp(0.5 + sunEl * 0.25, 0.35, 0.75));
+  R.hemi.intensity = clamp(0.5 + sunEl * 0.6, 0.35, 1.1);
+  if (sunEl > 0.12) tmpColor.copy(SKY_DAY).lerp(SKY_SET, clamp(1 - sunEl * 2.2, 0, 1) * 0.85);
+  else if (sunEl > -0.08) tmpColor.copy(SKY_SET).lerp(SKY_NIGHT, clamp((0.12 - sunEl) / 0.2, 0, 1));
+  else tmpColor.copy(SKY_NIGHT);
+  R.scene.background.copy(tmpColor);
+  R.scene.fog.color.copy(tmpColor);
+
+  // --- Cars ---
+  const seen = new Set();
+  const allCars = [...world.traffic, ...world.police];
+  if (world.player.car) allCars.push(world.player.car);
+  for (const car of allCars) {
+    seen.add(car);
+    const g = R.makeCarGroup(car);
+    g.position.set(car.x, 0, car.z);
+    g.rotation.y = car.heading;
+    if (car.kind === 'police') {
+      const bar = g.getObjectByName('lightbar');
+      if (bar) bar.material.emissive.setHex(Math.floor(time * 6) % 2 === 0 ? 0xff0000 : 0x0000ff);
+    }
+  }
+  for (const [car, g] of R.carGroups) {
+    if (!seen.has(car)) { R.scene.remove(g); R.carGroups.delete(car); }
+  }
+
+  // --- Pedestrians ---
+  for (const ped of world.peds) {
+    const g = R.makePedGroup(ped);
+    g.position.set(ped.x, ped.state === 'down' ? 0.35 : 0, ped.z);
+    g.rotation.y = ped.heading;
+    g.rotation.z = ped.state === 'down' ? Math.PI / 2 : 0;
+    g.visible = true;
+  }
+
+  // --- Helicopter ---
+  R.heli.visible = world.heli.active;
+  if (world.heli.active) {
+    R.heli.position.set(world.heli.x, world.heli.y, world.heli.z);
+    R.heli.rotation.y = world.heli.heading;
+    R.rotor.rotation.y = world.heli.rotor;
+  }
+
+  // --- Mission beacon ---
+  const target = currentTarget(world);
+  R.beacon.visible = !!target;
+  if (target) {
+    R.beacon.position.set(target.x, 0, target.z);
+    const s = 1 + Math.sin(time * 3) * 0.15;
+    R.beacon.scale.set(s, 1, s);
+  }
+
+  // --- Player marker ring (on foot only) ---
+  const p = world.player;
+  R.playerRing.visible = p.onFoot;
+  if (p.onFoot) R.playerRing.position.set(p.x, 0.1, p.z);
+
+  // --- Camera ---
+  R.orbit *= Math.max(0, 1 - dt * 1.2);
+  if (R.camOverride) {
+    R.camera.position.set(R.camOverride.pos[0], R.camOverride.pos[1], R.camOverride.pos[2]);
+    R.camera.lookAt(R.camOverride.look[0], R.camOverride.look[1], R.camOverride.look[2]);
+    return;
+  }
+  const pos = p.onFoot ? { x: p.x, z: p.z } : { x: p.car.x, z: p.car.z };
+  const fwd = p.onFoot
+    ? { x: -Math.sin(world.camYaw), z: -Math.cos(world.camYaw) }
+    : { x: Math.sin(p.heading), z: Math.cos(p.heading) };
+  const orbitA = R.orbit;
+  const fx = fwd.x * Math.cos(orbitA) - fwd.z * Math.sin(orbitA);
+  const fz = fwd.x * Math.sin(orbitA) + fwd.z * Math.cos(orbitA);
+  const dist = p.onFoot ? 9 : 13.5;
+  const height = p.onFoot ? 5 : 6.5;
+  const tx = pos.x - fx * dist;
+  const tz = pos.z - fz * dist;
+  const ty = height;
+  if (R.snapNext) {
+    R.camera.position.set(tx, ty, tz);
+    R.snapNext = false;
+  } else {
+    const k = Math.min(1, dt * 5);
+    R.camera.position.x += (tx - R.camera.position.x) * k;
+    R.camera.position.y += (ty - R.camera.position.y) * k;
+    R.camera.position.z += (tz - R.camera.position.z) * k;
+  }
+  R.camera.lookAt(pos.x + fx * 7, 1.6, pos.z + fz * 7);
 }

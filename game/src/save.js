@@ -1,28 +1,46 @@
-// Save and load through localStorage: cash, finished missions and the best
-// getaway score. Nothing here is needed for the game to run.
-// (v2, 18 Nov 2026) Unchanged: the save shape stays v1 so old saves still load.
-import { SAVE_KEY } from './config.js';
+// localStorage save / load. The storage object is injected so the headless
+// sim tests can pass a fake instead of the browser's localStorage.
+const KEY = 'solmar-heat-save-v1';
 
-export function readSave() {
+export function saveGame(storage, world) {
   try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
+    const data = {
+      cash: world.cash,
+      missionsDone: world.stats.missionsDone,
+      nextMission: world.missions.index + (world.missions.done ? 1 : 0),
+      health: world.player.health,
+      ammo: world.player.ammo,
+      x: world.player.x,
+      z: world.player.z,
+      time: world.time,
+    };
+    storage.setItem(KEY, JSON.stringify(data));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function loadGame(storage) {
+  try {
+    const raw = storage.getItem(KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    if (typeof data !== 'object' || data === null) return null;
-    return {
-      cash: Number(data.cash) || 0,
-      missionsDone: Array.isArray(data.missionsDone) ? data.missionsDone : [],
-      best: Number(data.best) || 0,
-    };
+    if (typeof data.cash !== 'number') return null;
+    return data;
   } catch {
     return null;
   }
 }
 
-export function writeSave(save) {
-  try {
-    window.localStorage.setItem(SAVE_KEY, JSON.stringify(save));
-  } catch {
-    // Storage can be off: the game still plays, it just does not remember.
-  }
+export function applySave(world, data) {
+  if (!data) return;
+  world.cash = data.cash;
+  world.stats.missionsDone = data.missionsDone || 0;
+  world.missions.index = Math.min(4, data.nextMission || 0);
+  world.player.health = data.health ?? 100;
+  world.player.ammo = data.ammo ?? 24;
+  world.player.x = data.x ?? world.player.x;
+  world.player.z = data.z ?? world.player.z;
+  world.time = data.time || 0;
 }

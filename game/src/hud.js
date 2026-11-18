@@ -1,205 +1,131 @@
-// The HUD and the menus: cash, wanted stars, health, speed, the mission
-// objective, a live minimap, phone-call banners and the title, pause and
-// end screens. All DOM; the 3D view never draws text.
-// (v2, 18 Nov 2026) Unchanged: the HUD already reads at 768x480, as the shots show.
-import { BEACH_Z, CITY_HALF, GRID, PITCH } from './config.js';
+// HUD: cash, stars, health, speed, objective + distance, clock, live minimap,
+// and the start / pause / busted / wasted screens. Browser only.
+import { CFG } from './config.js';
+import { roadCoord } from './city.js';
+import { objectiveInfo, clockString, playerPos } from './world.js';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_BUSTED = 'busted';
-export const SCREEN_WASTED = 'wasted';
-
-export function createHud() {
-  const el = (id) => document.getElementById(id);
-  const cash = el('cash');
-  const stars = el('stars');
-  const healthFill = el('health-fill');
-  const speed = el('speed');
-  const objective = el('objective');
-  const objectiveDist = el('objective-dist');
-  const clock = el('clock');
-  const ammo = el('ammo');
-  const toastBox = el('toast');
-  const banner = el('banner');
-  const bannerTitle = el('banner-title');
-  const bannerText = el('banner-text');
-  const menu = el('menu');
-  const menuTitle = el('menu-title');
-  const menuSub = el('menu-sub');
-  const menuButtons = el('menu-buttons');
-  const menuExtra = el('menu-extra');
-  const minimap = el('minimap');
-  const mapCtx = minimap.getContext('2d');
-  let toastTimer = 0;
-  let bannerTimer = 0;
-
-  function button(label, onClick) {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.addEventListener('click', onClick);
-    menuButtons.appendChild(b);
-    return b;
-  }
-
-  function showMenu(title, sub, extra) {
-    menuTitle.textContent = title;
-    menuSub.textContent = sub || '';
-    menuExtra.textContent = extra || '';
-    menuButtons.innerHTML = '';
-    menu.classList.remove('hidden');
-  }
-
+export function createHud(world) {
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    cash: $('hud-cash'), stars: $('hud-stars'), health: $('hud-health-fill'),
+    speed: $('hud-speed'), objective: $('hud-objective'), clock: $('hud-clock'),
+    ammo: $('hud-ammo'), toast: $('hud-toast'), minimap: $('minimap'),
+    screens: { start: $('screen-start'), pause: $('screen-pause'), busted: $('screen-busted'), wasted: $('screen-wasted') },
+    menuCash: $('menu-cash'), menuMissions: $('menu-missions'),
+  };
+  const mm = els.minimap.getContext('2d');
+  let toastT = 0;
   return {
-    toast(message, seconds) {
-      toastBox.textContent = message;
-      toastBox.classList.remove('hidden');
-      toastTimer = seconds || 3;
+    showToast(text, seconds = 4) {
+      els.toast.textContent = text;
+      els.toast.style.opacity = '1';
+      toastT = seconds;
     },
-    bannerCall(title, text, seconds) {
-      bannerTitle.textContent = title;
-      bannerText.textContent = text;
-      banner.classList.remove('hidden');
-      bannerTimer = seconds || 6;
-    },
-    tick(dt) {
-      if (toastTimer > 0) {
-        toastTimer -= dt;
-        if (toastTimer <= 0) toastBox.classList.add('hidden');
+    showScreen(name) {
+      for (const [key, el] of Object.entries(els.screens)) {
+        el.classList.toggle('hidden', key !== name);
       }
-      if (bannerTimer > 0) {
-        bannerTimer -= dt;
-        if (bannerTimer <= 0) banner.classList.add('hidden');
+      if (name === 'start') {
+        els.menuCash.textContent = `$${world.cash.toLocaleString()}`;
+        els.menuMissions.textContent = `${world.stats.missionsDone} of 5 jobs done`;
       }
     },
-    hideMenu() {
-      menu.classList.add('hidden');
+    hideScreens() {
+      for (const el of Object.values(els.screens)) el.classList.add('hidden');
     },
-    showTitle(save, callbacks) {
-      const lines = [
-        'SOLMAR HEAT',
-        'A sun-soaked open-world crime story. Steal cars, outrun the Solmar PD, and run jobs for Lena Voss.',
-      ];
-      showMenu(lines[0], lines[1], save ? `Saved game: $${save.cash} · ${save.missionsDone.length} job${save.missionsDone.length === 1 ? '' : 's'} done` : '');
-      button('▶  Start', callbacks.start);
-      if (save) button('Continue — $' + save.cash, callbacks.continue);
-      button('How to play', callbacks.help);
-      menuExtra.innerHTML += '<p class="controls">WASD drive / walk · E enter car · F punch · Click shoot · Shift run · Space handbrake · M mute · Esc pause</p>';
-    },
-    showHelp(callbacks) {
-      showMenu('How to play', 'Walk up to any car and press E to take it. Follow the yellow marker to run Lena\'s jobs. Stars mean the police are coming — lose them by hiding. Getting caught means Busted; losing all health means Wasted.', '');
-      button('← Back', callbacks.back);
-    },
-    showPause(callbacks) {
-      showMenu('Paused', 'Solmar waits for no one. Well — right now it does.', '');
-      button('Resume', callbacks.resume);
-      button('Restart day', callbacks.restart);
-      button('Quit to title', callbacks.quit);
-    },
-    showEnd(kind, stats, callbacks) {
-      if (kind === 'busted') {
-        showMenu('BUSTED', 'The Solmar PD caught up with you.', `Cash kept: $${stats.cash} · Jobs done: ${stats.jobs}`);
-      } else {
-        showMenu('WASTED', 'Solmar chewed you up.', `Cash kept: $${stats.cash} · Jobs done: ${stats.jobs}`);
+    update(dt) {
+      const p = world.player;
+      els.cash.textContent = `$${world.cash.toLocaleString()}`;
+      els.stars.textContent = '★'.repeat(world.wanted.stars) + '☆'.repeat(CFG.maxStars - world.wanted.stars);
+      els.stars.style.color = world.wanted.stars >= 4 ? '#ff4444' : world.wanted.stars > 0 ? '#ffcc22' : '#ffffff';
+      els.health.style.width = `${Math.max(0, p.health)}%`;
+      els.health.style.background = p.health > 50 ? '#4caf50' : p.health > 25 ? '#ff9800' : '#f44336';
+      const speedKmh = p.onFoot ? Math.round(p.speed * 3.6) : Math.round(Math.abs(p.car.speed) * 3.6);
+      els.speed.textContent = `${speedKmh} km/h`;
+      els.clock.textContent = clockString(world);
+      els.ammo.textContent = p.onFoot ? `🔫 ${p.ammo}` : '';
+      const obj = objectiveInfo(world);
+      els.objective.textContent = obj.dist !== null
+        ? `${obj.text} — ${obj.dist} m` : obj.text;
+      if (toastT > 0) {
+        toastT -= dt;
+        if (toastT <= 0) els.toast.style.opacity = '0';
       }
-      button('Try again', callbacks.retry);
-      button('Title screen', callbacks.quit);
-    },
-    showMissionComplete(mission, callbacks) {
-      showMenu('Job done: ' + mission.name, `Lena paid you $${mission.reward}.`, '');
-      button('Next job', callbacks.next);
-    },
-    update(world) {
-      cash.textContent = '$' + Math.floor(world.cash);
-      stars.textContent = '★'.repeat(world.wanted.level) + '☆'.repeat(5 - world.wanted.level);
-      stars.classList.toggle('hot', world.wanted.level > 0);
-      healthFill.style.width = Math.max(0, world.player.health) + '%';
-      healthFill.classList.toggle('low', world.player.health < 35);
-      const car = world.playerCar();
-      speed.textContent = car ? Math.round(Math.abs(car.speed) * 3.6) + ' km/h' : '';
-      ammo.textContent = world.player.inCar ? '' : `Ammo ${world.player.ammo}`;
-      const hours = 6 + world.timeOfDay * 18;
-      const hh = Math.floor(hours);
-      const mm = Math.floor((hours - hh) * 60);
-      clock.textContent = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
-      if (world.mission.active) {
-        const step = world.missionStep();
-        objective.textContent = step ? step.text : '';
-        const target = world.missionTarget();
-        if (target) {
-          const d = Math.hypot(world.playerX() - target.x, world.playerZ() - target.z);
-          objectiveDist.textContent = Math.round(d) + ' m';
-        } else {
-          objectiveDist.textContent = '';
-        }
-      } else if (world.nextMission()) {
-        objective.textContent = 'Next job: ' + world.nextMission().name + ' — press T to start';
-        objectiveDist.textContent = '';
-      } else {
-        objective.textContent = 'All jobs done — Solmar is yours. Free roam!';
-        objectiveDist.textContent = '';
-      }
-    },
-    drawMinimap(world) {
-      const size = minimap.width;
-      const ctx = mapCtx;
-      const minX = -CITY_HALF - 20;
-      const maxX = CITY_HALF + 20;
-      const minZ = -CITY_HALF - 20;
-      const maxZ = BEACH_Z + 60;
-      const sx = (x) => ((x - minX) / (maxX - minX)) * size;
-      const sz = (z) => ((z - minZ) / (maxZ - minZ)) * size;
-      ctx.clearRect(0, 0, size, size);
-      ctx.fillStyle = '#20242c';
-      ctx.fillRect(0, 0, size, size);
-      // Ocean.
-      ctx.fillStyle = '#2a7ab0';
-      ctx.fillRect(0, sz(BEACH_Z), size, size - sz(BEACH_Z));
-      // Blocks.
-      ctx.fillStyle = '#3a4048';
-      for (let bx = 0; bx < GRID; bx += 1) {
-        for (let bz = 0; bz < GRID; bz += 1) {
-          const x = -CITY_HALF + bx * PITCH + 6;
-          const z = -CITY_HALF + bz * PITCH + 6;
-          ctx.fillRect(sx(x), sz(z), sx(x + 40) - sx(x), sz(z + 40) - sz(z));
-        }
-      }
-      // Roads.
-      ctx.strokeStyle = '#565e68';
-      ctx.lineWidth = 2;
-      for (let i = 0; i <= GRID; i += 1) {
-        const c = -CITY_HALF + i * PITCH;
-        ctx.beginPath(); ctx.moveTo(sx(c), sz(minZ)); ctx.lineTo(sx(c), sz(maxZ)); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(sx(minX), sz(c)); ctx.lineTo(sx(maxX), sz(c)); ctx.stroke();
-      }
-      // Mission target.
-      const target = world.missionTarget();
-      if (target) {
-        const pulse = 5 + Math.sin(performance.now() / 200) * 2;
-        ctx.fillStyle = '#ffd040';
-        ctx.beginPath();
-        ctx.arc(sx(target.x), sz(target.z), pulse, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      // Cars.
-      for (const car of world.cars) {
-        ctx.fillStyle = car.police ? (Math.floor(performance.now() / 300) % 2 ? '#ff4040' : '#4080ff') : '#c8c8c8';
-        ctx.fillRect(sx(car.x) - 1.5, sz(car.z) - 1.5, 3, 3);
-      }
-      // Player arrow.
-      const px = sx(world.playerX());
-      const pz = sz(world.playerZ());
-      ctx.save();
-      ctx.translate(px, pz);
-      ctx.rotate(world.playerHeading());
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(0, -6);
-      ctx.lineTo(4, 5);
-      ctx.lineTo(-4, 5);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
+      drawMinimap(mm, world, els.minimap.width);
     },
   };
+}
+
+function drawMinimap(g, world, size) {
+  const S = size;
+  const toMap = (x, z) => [
+    ((x - CFG.cityMin) / (CFG.cityMax - CFG.cityMin)) * (S - 16) + 8,
+    ((z - CFG.cityMin) / (CFG.cityMax - CFG.cityMin)) * (S - 16) + 8,
+  ];
+  g.clearRect(0, 0, S, S);
+  g.fillStyle = 'rgba(10, 16, 24, 0.82)';
+  g.fillRect(0, 0, S, S);
+  // Blocks.
+  g.fillStyle = '#3a4a5a';
+  for (let i = 0; i < 9; i++) {
+    for (let j = 0; j < 9; j++) {
+      const [x, z] = toMap(roadCoord(i) + 26, roadCoord(j) + 26);
+      g.fillRect(x - 9, z - 9, 18, 18);
+    }
+  }
+  // Roads.
+  g.strokeStyle = '#6a7a8a';
+  g.lineWidth = 2;
+  for (let i = 0; i < 10; i++) {
+    const [a] = toMap(roadCoord(i), 0);
+    g.beginPath(); g.moveTo(a, 4); g.lineTo(a, S - 4); g.stroke();
+    const [, b] = toMap(0, roadCoord(i));
+    g.beginPath(); g.moveTo(4, b); g.lineTo(S - 4, b); g.stroke();
+  }
+  // Beach / ocean.
+  g.fillStyle = '#d9c08a';
+  g.fillRect(4, S - 14, S - 8, 6);
+  g.fillStyle = '#1a6f8f';
+  g.fillRect(4, S - 8, S - 8, 4);
+  // Mission target.
+  const obj = objectiveInfo(world);
+  if (obj.target) {
+    const [x, z] = toMap(obj.target.x, obj.target.z);
+    g.fillStyle = '#ffd21a';
+    g.beginPath(); g.arc(x, z, 5, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#ffd21a'; g.lineWidth = 1.5;
+    g.beginPath(); g.arc(x, z, 8, 0, Math.PI * 2); g.stroke();
+  }
+  // Police (red), traffic (grey), peds (dots).
+  g.fillStyle = '#ff4444';
+  for (const c of world.police) {
+    const [x, z] = toMap(c.x, c.z);
+    g.fillRect(x - 2.5, z - 2.5, 5, 5);
+  }
+  if (world.heli.active) {
+    const [x, z] = toMap(world.heli.x, world.heli.z);
+    g.fillStyle = '#ff8844';
+    g.beginPath(); g.arc(x, z, 4, 0, Math.PI * 2); g.fill();
+  }
+  g.fillStyle = '#bbbbbb';
+  for (const c of world.traffic) {
+    const [x, z] = toMap(c.x, c.z);
+    g.fillRect(x - 1.5, z - 1.5, 3, 3);
+  }
+  // Player arrow.
+  const pos = playerPos(world);
+  const [px, pz] = toMap(pos.x, pos.z);
+  const heading = world.player.heading;
+  g.fillStyle = '#ffffff';
+  g.save();
+  g.translate(px, pz);
+  g.rotate(Math.atan2(Math.sin(heading), -Math.cos(heading)) * -1 + Math.PI);
+  g.beginPath();
+  g.moveTo(0, -7); g.lineTo(5, 6); g.lineTo(0, 3); g.lineTo(-5, 6); g.closePath();
+  g.fill();
+  g.restore();
+  // North label.
+  g.fillStyle = '#9ab';
+  g.font = 'bold 10px sans-serif';
+  g.fillText('N', S - 14, 14);
 }
