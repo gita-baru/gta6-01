@@ -1,130 +1,182 @@
-// Solmar Heat — cars: arcade driving physics and traffic AI. Pure logic.
-import { TUNE } from "./config.js";
-import { bfs, insideBuilding, nearestNode, nearestRoadPoint, onSand, randomRoadPoint } from "./city.js";
-import { pick, range } from "./random.js";
+// Car physics and traffic AI, pure logic with no rendering dependency.
+// A car is a point with a heading and a velocity; the arcade model keeps a forward
+// speed and a small lateral slide, so drifting with the handbrake feels right.
+import { CAR, CITY } from './config.js';
+import { clamp, angleDiff, dist2 } from './random.js';
 
-let nextId = 1;
-
-export function makeCar(x, z, angle, color, kind) {
+export function makeCar(opts) {
   return {
-    id: nextId++,
-    x, z, angle,
+    kind: opts.kind || 'traffic', // traffic | player | police | mission
+    x: opts.x || 0,
+    z: opts.z || 0,
+    heading: opts.heading || 0,
     speed: 0,
+    slide: 0, // lateral velocity, metres per second
     steer: 0,
-    color,
-    kind, // 'traffic' | 'parked' | 'police' | 'mission' | 'player'
-    route: [],
-    routeIdx: 0,
-    repathT: 0,
-    hp: 100,
-    disabled: false,
+    color: opts.color ?? 0x808080,
+    id: opts.id || 0,
+    // Traffic state: which road the car is on and where it is going.
+    road: opts.road || null,
+    roadPos: 0,
+    roadDir: 1,
+    wait: 0,
+    siren: false,
+    // Police state.
+    path: null,
+    pathIndex: 0,
+    repath: 0,
   };
 }
 
-// Arcade driving: throttle, steering that bites harder with speed, and a
-// handbrake that cuts grip so the tail steps out. Returns distance driven.
-export function driveCar(car, input, dt, city) {
-  const was = { x: car.x, z: car.z };
-  const sand = onSand(car.z);
-  const grip = input.handbrake ? TUNE.handbrakeGrip : 1;
-  const accel = input.up ? TUNE.carAccel : input.down ? -TUNE.carBrake : 0;
-  car.speed += accel * dt;
-  if (!input.up && !input.down) car.speed -= car.speed * TUNE.carDrag * dt;
-  if (input.down && car.speed < 0.5) car.speed = Math.max(car.speed, -TUNE.carReverse);
-  const max = (sand ? 0.45 : 1) * TUNE.carMaxSpeed;
-  car.speed = Math.max(-TUNE.carReverse, Math.min(max, car.speed));
-  const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
-  car.steer += (steerTarget - car.steer) * Math.min(1, dt * 8);
-  const dir = car.speed >= 0 ? 1 : -1;
-  car.angle += car.steer * TUNE.steerRate * grip * dt * Math.min(1, Math.abs(car.speed) / 8) * dir;
-  car.x += Math.sin(car.angle) * car.speed * dt;
-  car.z += Math.cos(car.angle) * car.speed * dt;
-  const hit = insideBuilding(city, car.x, car.z, 1.6);
-  if (hit) {
-    // Push out along the smaller penetration axis and kill the speed.
-    const dx = car.x - hit.x;
-    const dz = car.z - hit.z;
-    const px = hit.hw + 1.6 - Math.abs(dx);
-    const pz = hit.hd + 1.6 - Math.abs(dz);
-    if (px < pz) car.x = hit.x + Math.sign(dx || 1) * (hit.hw + 1.6);
-    else car.z = hit.z + Math.sign(dz || 1) * (hit.hd + 1.6);
-    car.speed *= 0.35;
+// Arcade update for a driven car. input: {throttle, brake, steer (-1..1), handbrake}.
+// dt in seconds. Returns nothing; mutates the car.
+export function updateDrivenCar(car, input, dt) {
+  const targetSteer = clamp(input.steer || 0, -1, 1) * CAR.STEER_MAX;
+  car.steer += clamp(targetSteer - car.steer, -CAR.STEER_SPEED * dt, CAR.STEER_SPEED * dt);
+  const steerFactor = clamp(Math.abs(car.speed) / 8, 0, 1);
+  const turnRate = car.steer * steerFactor * (car.speed >= 0 ? 1 : -1);
+  car.heading += turnRate * dt * 1.9;
+
+  if (input.throttle) car.speed += CAR.ACCEL * dt;
+  if (input.brake) {
+    if (car.speed > 0.5) car.speed -= CAR.BRAKE * dt;
+    else car.speed -= CAR.REVERSE_ACCEL * dt;
   }
-  if (car.z > 320) {
-    car.z = 320;
-    car.speed *= 0.5;
-  }
-  if (Math.abs(car.x) > 246) {
-    car.x = Math.sign(car.x) * 246;
-    car.speed *= 0.5;
-  }
-  if (car.z < -246) {
-    car.z = -246;
-    car.speed *= 0.5;
-  }
-  return Math.hypot(car.x - was.x, car.z - was.z);
+  // Natural drag and rolling resistance.
+  car.speed -= car.speed * 0.35 * dt;
+  if (!input.throttle && !input.brake) car.speed -= car.speed * 0.5 * dt;
+  car.speed = clamp(car.speed, -CAR.MAX_REVERSE, CAR.MAX_SPEED);
+
+  // Lateral slide: grip pulls the slide back to zero; the handbrake lets it live.
+  const grip = input.handbrake ? CAR.DRIFT_GRIP : CAR.GRIP;
+  const lateral = car.slide;
+  car.slide = lateral * Math.max(0, 1 - grip * dt);
+  if (input.handbrake) car.slide += car.steer * car.speed * 0.35 * dt;
+  car.slide = clamp(car.slide, -6, 6);
+
+  const fx = Math.sin(car.heading);
+  const fz = Math.cos(car.heading);
+  const rx = Math.cos(car.heading);
+  const rz = -Math.sin(car.heading);
+  car.x += (fx * car.speed + rx * car.slide) * dt;
+  car.z += (fz * car.speed + rz * car.slide) * dt;
 }
 
-// Spawn n traffic cars on the roads, each with a route to follow.
-export function makeTraffic(n, city, rng) {
-  const cars = [];
-  for (let i = 0; i < n; i++) {
-    const p = randomRoadPoint(rng);
-    const dest = randomRoadPoint(rng);
-    const car = makeCar(p.x, p.z, rng() * Math.PI * 2, pick(rng, [0xc0392b, 0x2e86c1, 0xf1c40f, 0x95a5a6, 0x2c3e50, 0xe67e22]), "traffic");
-    car.route = bfs(city, nearestNode(city, p.x, p.z).id, nearestNode(city, dest.x, dest.z).id);
-    car.routeIdx = 1;
-    car.speed = range(rng, 7, 11);
-    cars.push(car);
-  }
-  return cars;
-}
-
-// One traffic car follows its route node to node, easing into corners.
-export function updateTraffic(car, dt, city, rng) {
-  if (car.disabled) return;
-  if (car.routeIdx >= car.route.length) {
-    const dest = randomRoadPoint(rng);
-    car.route = bfs(city, nearestNode(city, car.x, car.z).id, nearestNode(city, dest.x, dest.z).id);
-    car.routeIdx = 1;
-    if (car.route.length < 2) return;
-  }
-  const node = city.nodes[car.route[car.routeIdx]];
-  const dx = node.x - car.x;
-  const dz = node.z - car.z;
-  const dist = Math.hypot(dx, dz);
-  if (dist < 3) {
-    car.routeIdx++;
+// Traffic: each car drives along its road; at an intersection it picks a new road.
+// laneAxis is read off the road itself, never a null default.
+export function updateTrafficCar(car, city, rng, dt, others) {
+  if (car.wait > 0) {
+    car.wait -= dt;
+    car.speed = 0;
     return;
   }
-  const want = Math.atan2(dx, dz);
-  let diff = want - car.angle;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  car.angle += Math.max(-2.4 * dt, Math.min(2.4 * dt, diff));
-  const target = Math.abs(diff) > 0.9 ? 5 : TUNE.trafficSpeed;
-  car.speed += (target - car.speed) * Math.min(1, dt * 1.5);
-  car.x += Math.sin(car.angle) * car.speed * dt;
-  car.z += Math.cos(car.angle) * car.speed * dt;
-}
+  if (!car.road) assignRoad(car, city, rng);
+  const road = car.road;
+  const targetSpeed = CAR.TRAFFIC_SPEED + (car.id % 3);
+  car.speed += clamp(targetSpeed - car.speed, -6 * dt, 4 * dt);
 
-export function nearestCar(cars, x, z, maxD, kinds) {
-  let best = null;
-  let bestD = maxD;
-  for (const c of cars) {
-    if (kinds && !kinds.includes(c.kind)) continue;
-    if (c.disabled) continue;
-    const d = Math.hypot(c.x - x, c.z - z);
-    if (d < bestD) {
-      bestD = d;
-      best = c;
+  // Follow the road's lane: right-hand side for the direction of travel.
+  const lane = 2.4 * car.roadDir;
+  let heading;
+  if (road.axis === 'x') {
+    car.x += car.roadDir * car.speed * dt;
+    car.z += clamp(road.coord + lane - car.z, -4 * dt, 4 * dt);
+    heading = car.roadDir > 0 ? Math.PI / 2 : -Math.PI / 2;
+  } else {
+    car.z += car.roadDir * car.speed * dt;
+    car.x += clamp(road.coord + lane - car.x, -4 * dt, 4 * dt);
+    heading = car.roadDir > 0 ? 0 : Math.PI;
+  }
+  car.heading = heading;
+
+  // Gentle separation from the car ahead on the same road.
+  for (const other of others) {
+    if (other === car || other.kind !== 'traffic') continue;
+    if (other.road !== road || other.roadDir !== car.roadDir) continue;
+    const ahead =
+      road.axis === 'x'
+        ? (other.x - car.x) * car.roadDir
+        : (other.z - car.z) * car.roadDir;
+    if (ahead > 0 && ahead < 9) {
+      car.speed = Math.min(car.speed, Math.max(0, other.speed - 1));
+      if (ahead < 6.5) car.speed = 0;
     }
   }
-  return best;
+
+  // At the end of the road, pick a new one at the intersection.
+  const atEnd =
+    road.axis === 'x'
+      ? car.roadDir > 0
+        ? car.x >= road.to
+        : car.x <= road.from
+      : car.roadDir > 0
+        ? car.z >= road.to
+        : car.z <= road.from;
+  if (atEnd) {
+    const node = city.nearestIntersection(car.x, car.z);
+    pickNextRoad(car, city, rng, node);
+    car.wait = rng.chance(0.25) ? rng.range(0.5, 1.5) : 0;
+  }
 }
 
-export function snapCarToRoad(car, city) {
-  const p = nearestRoadPoint(car.x, car.z);
-  car.x = p.x;
-  car.z = p.z;
+function assignRoad(car, city, rng) {
+  const road = rng.pick(city.roads);
+  car.road = road;
+  car.roadDir = rng.chance(0.5) ? 1 : -1;
+  if (road.axis === 'x') {
+    car.x = rng.range(road.from + 10, road.to - 10);
+    car.z = road.coord + 2.4 * car.roadDir;
+  } else {
+    car.z = rng.range(road.from + 10, road.to - 10);
+    car.x = road.coord + 2.4 * car.roadDir;
+  }
+}
+
+function pickNextRoad(car, city, rng, node) {
+  const n = CITY.STREET_COUNT;
+  // From this intersection, choose a road through it: continue straight, turn
+  // left/right, or (rarely) turn back. The road's axis and direction follow.
+  // roads[] layout: for street i, index 2i is the x-road, 2i+1 the z-road.
+  const fixed = [];
+  if (node.ix > 0) fixed.push({ road: city.roads[node.ix * 2 + 1], dir: -1 });
+  if (node.ix < n - 1) fixed.push({ road: city.roads[node.ix * 2 + 1], dir: 1 });
+  if (node.iz > 0) fixed.push({ road: city.roads[node.iz * 2], dir: -1 });
+  if (node.iz < n - 1) fixed.push({ road: city.roads[node.iz * 2], dir: 1 });
+  const choice = rng.pick(fixed);
+  car.road = choice.road;
+  car.roadDir = choice.dir;
+  // Snap onto the new road's lane so the car never cuts a corner through a block.
+  if (car.road.axis === 'x') car.z = car.road.coord + 2.4 * car.roadDir;
+  else car.x = car.road.coord + 2.4 * car.roadDir;
+}
+
+// Circle-circle push-apart for two cars. Returns true on contact.
+export function separateCars(a, b) {
+  const min = CAR.RADIUS * 2 - 0.6;
+  const d = dist2(a.x, a.z, b.x, b.z);
+  if (d >= min || d < 1e-6) return false;
+  const push = (min - d) / 2 / d;
+  const px = (a.x - b.x) * push;
+  const pz = (a.z - b.z) * push;
+  a.x += px;
+  a.z += pz;
+  b.x -= px;
+  b.z -= pz;
+  return true;
+}
+
+// Steer a car toward a target point, arcade style. Returns the input to feed
+// updateDrivenCar, with full throttle.
+export function steerToward(car, tx, tz, speedCap) {
+  const dx = tx - car.x;
+  const dz = tz - car.z;
+  const want = Math.atan2(dx, dz);
+  const diff = angleDiff(car.heading, want);
+  const steer = clamp(diff * 1.6, -1, 1);
+  return {
+    throttle: car.speed < (speedCap ?? CAR.MAX_SPEED),
+    brake: false,
+    steer,
+    handbrake: Math.abs(diff) > 1.1 && car.speed > 12,
+  };
 }

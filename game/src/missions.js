@@ -1,95 +1,125 @@
-// Solmar Heat — the five story jobs from fixer Lena Voss. A small state
-// machine: each mission is a list of steps, each step a place or a trial.
-import { MISSIONS } from "./config.js";
-import { addWanted } from "./police.js";
+// The five story missions from fixer Lena Voss, as a pure state machine.
+// A mission is a list of stages; each stage is a beacon to reach, a car to steal
+// and deliver, or a stretch of time to survive. The machine only tracks progress;
+// the renderer draws the beacon and the HUD shows the objective text.
+import { MISSIONS } from './config.js';
+import { dist2 } from './random.js';
 
-export function startMission(S, index) {
-  const m = MISSIONS[index];
-  const done = S.mission.done;
-  S.mission = {
-    index,
-    step: 0,
-    active: true,
-    targetCar: null,
-    timer: m.steps[0].time || 0,
-    text: m.steps[0].text,
-    done,
+export function makeMissionState() {
+  return {
+    index: 0, // which mission is active (0..4), -1 when all done
+    stage: 0,
+    stageTimer: 0, // seconds left in a timed stage, or seconds survived
+    done: [], // completed mission ids
+    active: null, // the mission object currently running
+    message: '',
+    messageTimer: 0,
   };
-  if (m.id === "getaway") addWanted(S, 3);
-  if (m.id === "nightrun") S.clock = 21 * 3600;
-  if (m.id === "heatwave") addWanted(S, 5);
-  if (m.id === "hotwheels") {
-    const comet = S.cars.find((c) => c.kind === "mission");
-    if (comet) S.mission.targetCar = comet.id;
-  }
-  S.fx.push({ type: "mission", text: `${m.name}: ${m.briefing}` });
-  return m;
 }
 
-export function currentObjective(S) {
-  if (!S.mission.active) return null;
-  const m = MISSIONS[S.mission.index];
-  const step = m.steps[S.mission.step];
-  if (!step) return null;
-  if (step.type === "survive") {
-    return { text: step.text, x: S.player.x, z: S.player.z, dist: 0, timer: S.mission.timer };
-  }
-  const dist = Math.hypot(step.x - S.player.x, step.z - S.player.z);
-  return { text: step.text, x: step.x, z: step.z, dist, timer: S.mission.timer };
+export function startMission(state, index) {
+  const def = MISSIONS[index];
+  if (!def) return null;
+  state.index = index;
+  state.stage = 0;
+  state.stageTimer = 0;
+  state.active = def;
+  state.message = def.intro;
+  state.messageTimer = 6;
+  return def;
 }
 
-function advance(S) {
-  const m = MISSIONS[S.mission.index];
-  S.mission.step++;
-  if (S.mission.step >= m.steps.length) {
-    S.money += m.reward;
-    S.mission.done[S.mission.index] = true;
-    S.mission.active = false;
-    S.fx.push({ type: "paid", text: `${m.name} complete — $${m.reward.toLocaleString("en-US")}` });
-    S.fx.push({ type: "pickup" });
-    return { type: "complete", mission: m };
-  }
-  const step = m.steps[S.mission.step];
-  S.mission.text = step.text;
-  S.mission.timer = step.time || 0;
-  return { type: "step", mission: m, step };
+// Current objective: {label, x, z, radius, type} or null when no mission runs.
+export function currentObjective(state) {
+  if (!state.active) return null;
+  const stage = state.active.stages[state.stage];
+  if (!stage) return null;
+  return {
+    label: stage.label,
+    type: stage.type,
+    x: stage.x,
+    z: stage.z,
+    radius: stage.radius ?? 6,
+    seconds: stage.seconds ?? 0,
+  };
 }
 
-// Returns an event object when a step completes, a mission ends or fails.
-export function updateMission(S, dt) {
-  if (!S.mission.active) return null;
-  const m = MISSIONS[S.mission.index];
-  const step = m.steps[S.mission.step];
-  if (!step) return null;
-  if (step.type === "goto") {
-    const d = Math.hypot(step.x - S.player.x, step.z - S.player.z);
-    if (d < step.radius) {
-      S.fx.push({ type: "pickup" });
-      return advance(S);
+// Advance the mission machine by dt. player: {x, z, inCar, car}. Returns events:
+// [{type: 'stage'|'complete'|'failed', ...}] for the HUD and the sound to react to.
+export function updateMissions(state, player, dt) {
+  const events = [];
+  if (!state.active) return events;
+  const stage = state.active.stages[state.stage];
+  if (!stage) return events;
+
+  if (stage.type === 'survive') {
+    state.stageTimer += dt;
+    if (state.stageTimer >= (stage.seconds || 30)) {
+      events.push(advanceStage(state));
     }
-  } else if (step.type === "steal") {
-    const car = S.player.car;
-    if (car && S.mission.targetCar === car.id) return advance(S);
-  } else if (step.type === "timed") {
-    S.mission.timer -= dt;
-    if (S.mission.timer <= 0) {
-      S.mission.active = false;
-      S.fx.push({ type: "fail", text: `${m.name} failed — out of time` });
-      return { type: "failed", mission: m };
-    }
-    const d = Math.hypot(step.x - S.player.x, step.z - S.player.z);
-    if (d < step.radius) return advance(S);
-  } else if (step.type === "survive") {
-    S.mission.timer -= dt;
-    if (S.wanted < 5) addWanted(S, 5 - S.wanted);
-    if (S.mission.timer <= 0) return advance(S);
+    return events;
   }
-  return null;
+
+  if (stage.timeLimit !== undefined) {
+    state.stageTimer += dt;
+    if (state.stageTimer >= stage.timeLimit) {
+      events.push({ type: 'failed', reason: 'Time ran out.' });
+      state.active = null;
+      return events;
+    }
+  }
+
+  if (stage.type === 'goto' || stage.type === 'deliver') {
+    const d = dist2(player.x, player.z, stage.x, stage.z);
+    if (stage.type === 'deliver' && !player.inCar) {
+      // Deliveries need the car; standing there on foot does not count.
+    } else if (d <= (stage.radius ?? 6)) {
+      events.push(advanceStage(state));
+    }
+    return events;
+  }
+
+  if (stage.type === 'steal') {
+    // Done when the player is driving the mission car (flagged on the car).
+    if (player.inCar && player.car && player.car.missionCar) {
+      events.push(advanceStage(state));
+    }
+    return events;
+  }
+
+  return events;
 }
 
-export function nextMissionIndex(S) {
-  for (let i = 0; i < MISSIONS.length; i++) {
-    if (!S.mission.done[i]) return i;
+function advanceStage(state) {
+  state.stage++;
+  state.stageTimer = 0;
+  if (state.stage >= state.active.stages.length) {
+    const done = state.active;
+    state.done.push(done.id);
+    state.active = null;
+    state.index++;
+    const event = { type: 'complete', mission: done, reward: done.reward };
+    state.message = `Mission complete: ${done.name} — $${done.reward}`;
+    state.messageTimer = 5;
+    return event;
   }
-  return -1;
+  const next = state.active.stages[state.stage];
+  state.message = next.label;
+  state.messageTimer = 4;
+  return { type: 'stage', label: next.label };
+}
+
+// Distance to the current objective, for the HUD. Infinity when idle.
+export function objectiveDistance(state, player) {
+  const obj = currentObjective(state);
+  if (!obj || obj.x === undefined) return Infinity;
+  return dist2(player.x, player.z, obj.x, obj.z);
+}
+
+export function missionsLeft(state) {
+  return MISSIONS.length - state.done.length;
+}
+
+export function allMissionsDone(state) {
+  return state.done.length >= MISSIONS.length;
 }

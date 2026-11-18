@@ -1,420 +1,554 @@
-// Solmar Heat — the Three.js view: the city, the cars, the people, the sky.
-// Reads the plain game state and moves meshes to match it.
-import { BLOCK, BOUND, MISSIONS, PITCH, STREETS } from "./config.js";
+// Three.js rendering for Solmar Heat: the city, the ocean, the cars, the people,
+// the helicopter, the beacon, the day-sunset cycle and the chase camera.
+// The simulation stays in the pure-logic modules; this file only turns state
+// into meshes, lights and a camera position every frame.
+import * as THREE from 'three';
+import { CITY, PALETTE } from './config.js';
+import { clamp } from './random.js';
 
-const THREE = window.THREE;
-
-function makeWindowTexture() {
-  const c = document.createElement("canvas");
-  c.width = 128;
-  c.height = 256;
-  const g = c.getContext("2d");
-  g.fillStyle = "#20242a";
-  g.fillRect(0, 0, 128, 256);
-  for (let y = 10; y < 246; y += 22) {
-    for (let x = 10; x < 118; x += 18) {
-      g.fillStyle = Math.random() < 0.45 ? "#ffd98a" : "#3a4a5a";
-      g.fillRect(x, y, 10, 14);
+function groundTexture(city) {
+  const S = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = S;
+  canvas.height = S;
+  const ctx = canvas.getContext('2d');
+  const scale = S / (CITY.WORLD_HALF * 2);
+  const toPx = (v) => (v + CITY.WORLD_HALF) * scale;
+  // Base: sidewalk grey.
+  ctx.fillStyle = '#b8b0a0';
+  ctx.fillRect(0, 0, S, S);
+  // Blocks: grass green, plaza tan, park darker green.
+  for (const b of city.blocks) {
+    const x = toPx(b.cx - 20);
+    const y = toPx(b.cz - 20);
+    const w = 40 * scale;
+    ctx.fillStyle = b.kind === 'plaza' ? '#cbb98f' : b.kind === 'park' ? '#6f9a5e' : '#8fae7a';
+    ctx.fillRect(x, y, w, w);
+    if (b.kind === 'plaza') {
+      ctx.strokeStyle = '#a89060';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 4, y + 4, w - 8, w - 8);
     }
   }
-  const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
+  // Roads: asphalt strips with dashed centre lines.
+  for (const s of city.streets) {
+    const c = toPx(s);
+    const half = CITY.ROAD_HALF * scale;
+    ctx.fillStyle = '#3a3f4a';
+    ctx.fillRect(0, c - half, S, half * 2);
+    ctx.fillRect(c - half, 0, half * 2, S);
+  }
+  ctx.strokeStyle = '#d8c860';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([10, 12]);
+  for (const s of city.streets) {
+    const c = toPx(s);
+    ctx.beginPath();
+    ctx.moveTo(0, c);
+    ctx.lineTo(S, c);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(c, 0);
+    ctx.lineTo(c, S);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // Beach sand and the water's edge.
+  ctx.fillStyle = '#e3cf9e';
+  ctx.fillRect(0, toPx(CITY.BEACH_START), S, toPx(CITY.SAND_END) - toPx(CITY.BEACH_START));
+  ctx.fillStyle = '#1e6f8e';
+  ctx.fillRect(0, toPx(CITY.SAND_END), S, S - toPx(CITY.SAND_END));
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
   return tex;
 }
 
-// Sky keyframes: [hour, color, sun intensity].
-const SKY = [
-  [0, 0x0b1026, 0.12],
-  [5, 0x0b1026, 0.12],
-  [7, 0xe8906b, 0.55],
-  [9, 0x87b5e0, 1.05],
-  [16, 0x8fc0e8, 1.05],
-  [18.5, 0xe07840, 0.5],
-  [20, 0x0b1026, 0.12],
-  [24, 0x0b1026, 0.12],
-];
-
-function skyAt(clock) {
-  const h = (clock / 3600) % 24;
-  for (let i = 0; i < SKY.length - 1; i++) {
-    const [h0, c0, s0] = SKY[i];
-    const [h1, c1, s1] = SKY[i + 1];
-    if (h >= h0 && h <= h1) {
-      const f = (h - h0) / (h1 - h0 || 1);
-      const col = new THREE.Color(c0).lerp(new THREE.Color(c1), f);
-      return { color: col, sun: s0 + (s1 - s0) * f, day: f };
+function buildingTexture(baseColor, litRatio, seed) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = baseColor;
+  ctx.fillRect(0, 0, 128, 256);
+  // Window grid: some lit warm, most dark glass.
+  let s = seed;
+  const rnd = () => {
+    s = (s * 16807) % 2147483647;
+    return s / 2147483647;
+  };
+  for (let row = 0; row < 12; row++) {
+    for (let col = 0; col < 6; col++) {
+      const lit = rnd() < litRatio;
+      ctx.fillStyle = lit ? '#ffd88a' : '#2a4a5a';
+      ctx.fillRect(10 + col * 19, 12 + row * 20, 12, 12);
     }
   }
-  return { color: new THREE.Color(0x0b1026), sun: 0.12, day: 0 };
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
-export class Renderer {
-  constructor(container, city) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    container.appendChild(this.renderer.domElement);
-    this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(0x87b5e0, 220, 760);
-    this.camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 2000);
-    this.camera.position.set(0, 40, 80);
-    this.sun = new THREE.DirectionalLight(0xffffff, 1);
-    this.sun.position.set(120, 180, 60);
-    this.scene.add(this.sun);
-    this.scene.add(new THREE.HemisphereLight(0xbfd9ff, 0x3a3230, 0.7));
-    this.city = city;
-    this.carMeshes = new Map();
-    this.pedMeshes = new Map();
-    this.windowTex = makeWindowTexture();
-    this.buildStatic();
-    this.beacon = this.makeBeacon();
-    this.heli = this.makeHeli();
-    this.scene.add(this.beacon);
-    this.scene.add(this.heli);
-    window.addEventListener("resize", () => {
-      this.camera.aspect = window.innerWidth / window.innerHeight;
-      this.camera.updateProjectionMatrix();
-      this.renderer.setSize(window.innerWidth, window.innerHeight);
-    });
+function makeCarMesh(color, isPolice) {
+  const group = new THREE.Group();
+  const bodyMat = new THREE.MeshLambertMaterial({ color });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.65, 4.4), bodyMat);
+  body.position.y = 0.55;
+  group.add(body);
+  const glassMat = new THREE.MeshLambertMaterial({ color: 0x223844 });
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.55, 2.1), glassMat);
+  cabin.position.set(0, 1.12, -0.25);
+  group.add(cabin);
+  const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 12);
+  const wheelMat = new THREE.MeshLambertMaterial({ color: 0x141414 });
+  for (const [wx, wz] of [[-0.95, 1.45], [0.95, 1.45], [-0.95, -1.45], [0.95, -1.45]]) {
+    const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+    wheel.rotation.z = Math.PI / 2;
+    wheel.position.set(wx, 0.36, wz);
+    group.add(wheel);
   }
-
-  box(w, h, d, color, x, y, z, opts = {}) {
-    const m = new THREE.Mesh(
-      new THREE.BoxGeometry(w, h, d),
-      new THREE.MeshLambertMaterial({ color, ...opts })
-    );
-    m.position.set(x, y, z);
-    this.scene.add(m);
-    return m;
+  const lightMat = new THREE.MeshBasicMaterial({ color: 0xfff2b0 });
+  for (const wx of [-0.6, 0.6]) {
+    const light = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.18, 0.1), lightMat);
+    light.position.set(wx, 0.62, 2.22);
+    group.add(light);
   }
+  if (isPolice) {
+    const red = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.18, 0.4),
+      new THREE.MeshBasicMaterial({ color: 0xff2020 }),
+    );
+    red.position.set(-0.45, 1.48, -0.25);
+    red.name = 'sirenRed';
+    group.add(red);
+    const blue = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.18, 0.4),
+      new THREE.MeshBasicMaterial({ color: 0x2040ff }),
+    );
+    blue.position.set(0.45, 1.48, -0.25);
+    blue.name = 'sirenBlue';
+    group.add(blue);
+  }
+  // Cheap blob shadow.
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(2.3, 20),
+    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.28 }),
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = 0.02;
+  shadow.scale.set(1, 1.5, 1);
+  group.add(shadow);
+  return group;
+}
 
-  buildStatic() {
-    // Ground, sand and ocean.
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(1100, 1100),
-      new THREE.MeshLambertMaterial({ color: 0x5d7a4e })
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.set(0, -0.05, 120);
-    this.scene.add(ground);
-    const sand = new THREE.Mesh(
-      new THREE.PlaneGeometry(520, 46),
-      new THREE.MeshLambertMaterial({ color: 0xe0c98f })
-    );
-    sand.rotation.x = -Math.PI / 2;
-    sand.position.set(0, 0.02, 266);
-    this.scene.add(sand);
-    this.ocean = new THREE.Mesh(
-      new THREE.PlaneGeometry(1100, 460),
-      new THREE.MeshPhongMaterial({ color: 0x1a5f8a, transparent: true, opacity: 0.92, shininess: 120 })
-    );
-    this.ocean.rotation.x = -Math.PI / 2;
-    this.ocean.position.set(0, 0.1, 520);
-    this.scene.add(this.ocean);
-    // Sidewalk strips, then darker road strips on top.
-    for (const s of STREETS) {
-      const sw1 = new THREE.Mesh(
-        new THREE.PlaneGeometry(16, 500),
-        new THREE.MeshLambertMaterial({ color: 0x8a8a84 })
-      );
-      sw1.rotation.x = -Math.PI / 2;
-      sw1.position.set(s, 0.01, 0);
-      this.scene.add(sw1);
-      const rd1 = new THREE.Mesh(
-        new THREE.PlaneGeometry(12, 500),
-        new THREE.MeshLambertMaterial({ color: 0x2b2b30 })
-      );
-      rd1.rotation.x = -Math.PI / 2;
-      rd1.position.set(s, 0.03, 0);
-      this.scene.add(rd1);
-      const sw2 = new THREE.Mesh(
-        new THREE.PlaneGeometry(500, 16),
-        new THREE.MeshLambertMaterial({ color: 0x8a8a84 })
-      );
-      sw2.rotation.x = -Math.PI / 2;
-      sw2.position.set(0, 0.01, s);
-      this.scene.add(sw2);
-      const rd2 = new THREE.Mesh(
-        new THREE.PlaneGeometry(500, 12),
-        new THREE.MeshLambertMaterial({ color: 0x2b2b30 })
-      );
-      rd2.rotation.x = -Math.PI / 2;
-      rd2.position.set(0, 0.03, s);
-      this.scene.add(rd2);
+function makePersonMesh(shirtColor) {
+  const group = new THREE.Group();
+  const skin = new THREE.MeshLambertMaterial({ color: 0xd8a070 });
+  const shirt = new THREE.MeshLambertMaterial({ color: shirtColor });
+  const pants = new THREE.MeshLambertMaterial({ color: 0x2a2a3a });
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.5, 0.22), pants);
+  legL.position.set(-0.14, 0.25, 0);
+  legL.name = 'legL';
+  group.add(legL);
+  const legR = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.5, 0.22), pants);
+  legR.position.set(0.14, 0.25, 0);
+  legR.name = 'legR';
+  group.add(legR);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.7, 0.36), shirt);
+  torso.position.y = 0.85;
+  group.add(torso);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.27, 12, 10), skin);
+  head.position.y = 1.45;
+  group.add(head);
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 0.16), shirt);
+  armL.position.set(-0.4, 0.9, 0);
+  armL.name = 'armL';
+  group.add(armL);
+  const armR = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 0.16), shirt);
+  armR.position.set(0.4, 0.9, 0);
+  armR.name = 'armR';
+  group.add(armR);
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(0.7, 14),
+    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25 }),
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = 0.02;
+  group.add(shadow);
+  return group;
+}
+
+export function createRenderer(canvas, city) {
+  // preserveDrawingBuffer keeps the last rendered frame in the canvas so a
+  // screenshot taken between animation frames still captures the 3D view.
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0xbfd4e0, 180, 700);
+  const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 1500);
+
+  // Lights: sun + sky fill. Both are re-aimed and recoloured by the hour.
+  const sun = new THREE.DirectionalLight(0xffe0b0, 2.2);
+  scene.add(sun);
+  const hemi = new THREE.HemisphereLight(0xbfd4e0, 0x5a4a38, 0.9);
+  scene.add(hemi);
+
+  // Ground with the painted city texture.
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(CITY.WORLD_HALF * 2, CITY.WORLD_HALF * 2),
+    new THREE.MeshLambertMaterial({ map: groundTexture(city) }),
+  );
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
+
+  // Ocean: a second plane past the sand, gently breathing.
+  const ocean = new THREE.Mesh(
+    new THREE.PlaneGeometry(CITY.WORLD_HALF * 2, 220),
+    new THREE.MeshPhongMaterial({ color: PALETTE.OCEAN, transparent: true, opacity: 0.92, shininess: 90 }),
+  );
+  ocean.rotation.x = -Math.PI / 2;
+  ocean.position.set(0, 0.15, CITY.SAND_END + 110);
+  scene.add(ocean);
+
+  // Buildings with window facades, in three texture variants.
+  const facadeMats = [0, 1, 2].map((v) => {
+    const tex = buildingTexture('#cfc0a8', 0.25, 1234 + v * 777);
+    return new THREE.MeshLambertMaterial({ map: tex });
+  });
+  const roofMat = new THREE.MeshLambertMaterial({ color: 0x5a5148 });
+  const buildingMeshes = [];
+  city.buildings.forEach((b, i) => {
+    const mats = [facadeMats[i % 3], facadeMats[i % 3], roofMat, roofMat, facadeMats[i % 3], facadeMats[i % 3]];
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, b.d), mats);
+    mesh.position.set(b.x, b.h / 2, b.z);
+    scene.add(mesh);
+    buildingMeshes.push(mesh);
+    if (b.h > 26) {
+      const roof = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.4, 1.2, b.d * 0.4), roofMat);
+      roof.position.set(b.x, b.h + 0.6, b.z);
+      scene.add(roof);
     }
-    // Block slabs and buildings.
-    for (const b of this.city.blocks) {
-      const color = b.kind === "park" ? 0x4a7c43 : b.kind === "plaza" ? 0xb0a894 : 0x9a938a;
-      const slab = new THREE.Mesh(
-        new THREE.BoxGeometry(BLOCK, 0.6, BLOCK),
-        new THREE.MeshLambertMaterial({ color })
-      );
-      slab.position.set(b.x, 0.3, b.z);
-      this.scene.add(slab);
-      if (b.kind === "park") {
-        for (let i = 0; i < 3; i++) {
-          const tx = b.x + (i - 1) * 10;
-          const tz = b.z + ((i % 2) - 0.5) * 12;
-          const trunk = new THREE.Mesh(
-            new THREE.CylinderGeometry(0.4, 0.5, 3, 6),
-            new THREE.MeshLambertMaterial({ color: 0x6b4a2f })
-          );
-          trunk.position.set(tx, 2, tz);
-          this.scene.add(trunk);
-          const top = new THREE.Mesh(
-            new THREE.ConeGeometry(3, 7, 8),
-            new THREE.MeshLambertMaterial({ color: 0x2f6b2f })
-          );
-          top.position.set(tx, 6.5, tz);
-          this.scene.add(top);
-        }
+  });
+
+  // Palms: trunk + a crown of flat fronds.
+  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8a6a42 });
+  const frondMat = new THREE.MeshLambertMaterial({ color: 0x3f8a4a, side: THREE.DoubleSide });
+  for (const palm of city.palms) {
+    const group = new THREE.Group();
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, palm.h, 6), trunkMat);
+    trunk.position.y = palm.h / 2;
+    group.add(trunk);
+    for (let f = 0; f < 6; f++) {
+      const frond = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 0.7), frondMat);
+      frond.position.y = palm.h + 0.2;
+      frond.rotation.y = (f / 6) * Math.PI * 2;
+      frond.rotation.x = -0.5;
+      frond.translateY(0.9);
+      group.add(frond);
+    }
+    group.position.set(palm.x, 0, palm.z);
+    scene.add(group);
+  }
+
+  // Street lamps along every second street.
+  const lampMat = new THREE.MeshLambertMaterial({ color: 0x333338 });
+  const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffe9a0 });
+  const lampHeads = [];
+  for (const s of city.streets) {
+    if (Math.round(s) % 100 !== 0) continue;
+    for (const along of [-175, -75, 25, 125, 225]) {
+      for (const [x, z] of [[s + 6.5, along], [along, s + 6.5]]) {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.12, 5.4, 6), lampMat);
+        pole.position.set(x, 2.7, z);
+        scene.add(pole);
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 6), lampHeadMat.clone());
+        head.position.set(x, 5.5, z);
+        scene.add(head);
+        lampHeads.push(head);
       }
     }
-    for (const b of this.city.buildings) {
-      const mat = new THREE.MeshLambertMaterial({ color: b.color, map: this.windowTex });
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(b.hw * 2, b.h, b.hd * 2), mat);
-      mesh.position.set(b.x, b.h / 2 + 0.6, b.z);
-      this.scene.add(mesh);
-      const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(b.hw * 2 + 0.4, 0.5, b.hd * 2 + 0.4),
-        new THREE.MeshLambertMaterial({ color: 0x3a3a3a })
-      );
-      roof.position.set(b.x, b.h + 0.85, b.z);
-      this.scene.add(roof);
+  }
+
+  // Sun disc + drifting clouds.
+  const sunDisc = new THREE.Mesh(
+    new THREE.SphereGeometry(14, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffd27a, fog: false }),
+  );
+  scene.add(sunDisc);
+  const clouds = [];
+  const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+  for (let i = 0; i < 10; i++) {
+    const cloud = new THREE.Group();
+    for (let j = 0; j < 3; j++) {
+      const puff = new THREE.Mesh(new THREE.SphereGeometry(6 + j * 2, 10, 8), cloudMat);
+      puff.position.set(j * 7 - 7, j % 2, 0);
+      puff.scale.y = 0.45;
+      cloud.add(puff);
     }
-    // A pier into the ocean and a ferris wheel silhouette on the beach.
-    const pier = new THREE.Mesh(
-      new THREE.BoxGeometry(8, 1, 60),
-      new THREE.MeshLambertMaterial({ color: 0x7a5c3a })
-    );
-    pier.position.set(-130, 0.6, 310);
-    this.scene.add(pier);
-    const wheel = new THREE.Mesh(
-      new THREE.TorusGeometry(14, 0.8, 8, 24),
-      new THREE.MeshLambertMaterial({ color: 0xf1c40f })
-    );
-    wheel.position.set(130, 22, 270);
-    this.scene.add(wheel);
+    cloud.position.set(-300 + i * 65, 90 + (i % 3) * 14, -220 + (i % 4) * 110);
+    scene.add(cloud);
+    clouds.push(cloud);
   }
 
-  makeBeacon() {
-    const g = new THREE.Group();
-    const col = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.4, 1.4, 70, 12, 1, true),
-      new THREE.MeshBasicMaterial({ color: 0xf1c40f, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false })
-    );
-    col.position.y = 35;
-    g.add(col);
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(3, 0.35, 8, 24),
-      new THREE.MeshBasicMaterial({ color: 0xf1c40f })
-    );
-    ring.rotation.x = Math.PI / 2;
-    ring.position.y = 0.4;
-    g.add(ring);
-    return g;
-  }
+  // Mission beacon: a glowing pillar and a ground ring.
+  const beacon = new THREE.Group();
+  const pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.2, 2.2, 70, 16, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false }),
+  );
+  pillar.position.y = 35;
+  beacon.add(pillar);
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(3, 4.2, 32),
+    new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: 0.8, side: THREE.DoubleSide }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.1;
+  beacon.add(ring);
+  beacon.visible = false;
+  scene.add(beacon);
 
-  makeHeli() {
-    const g = new THREE.Group();
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(4.5, 2, 2.4),
-      new THREE.MeshLambertMaterial({ color: 0x1a2a4a })
-    );
-    g.add(body);
-    const tail = new THREE.Mesh(
-      new THREE.BoxGeometry(4, 0.7, 0.7),
-      new THREE.MeshLambertMaterial({ color: 0x1a2a4a })
-    );
-    tail.position.set(-4, 0.4, 0);
-    g.add(tail);
-    this.rotor = new THREE.Mesh(
-      new THREE.BoxGeometry(11, 0.15, 0.7),
-      new THREE.MeshLambertMaterial({ color: 0x222222 })
-    );
-    this.rotor.position.y = 1.3;
-    g.add(this.rotor);
-    const lamp = new THREE.Mesh(
-      new THREE.SphereGeometry(0.5, 8, 8),
-      new THREE.MeshBasicMaterial({ color: 0xfff2a8 })
-    );
-    lamp.position.set(0, -1.2, 0);
-    g.add(lamp);
-    g.visible = false;
-    return g;
-  }
+  // Helicopter.
+  const heli = new THREE.Group();
+  const heliBody = new THREE.Mesh(new THREE.BoxGeometry(2.4, 1.3, 5), new THREE.MeshLambertMaterial({ color: 0x20242e }));
+  heliBody.position.y = 0;
+  heli.add(heliBody);
+  const heliTail = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 4), new THREE.MeshLambertMaterial({ color: 0x20242e }));
+  heliTail.position.set(0, 0.2, -4);
+  heli.add(heliTail);
+  const rotor = new THREE.Mesh(new THREE.BoxGeometry(11, 0.12, 0.6), new THREE.MeshLambertMaterial({ color: 0x111111 }));
+  rotor.position.y = 0.9;
+  rotor.name = 'rotor';
+  heli.add(rotor);
+  const spot = new THREE.Mesh(
+    new THREE.ConeGeometry(7, 42, 20, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xfff2b0, transparent: true, opacity: 0.13, side: THREE.DoubleSide, depthWrite: false }),
+  );
+  spot.position.y = -21;
+  heli.add(spot);
+  heli.visible = false;
+  scene.add(heli);
 
-  makeCarMesh(car) {
-    const g = new THREE.Group();
-    const bodyColor = car.kind === "police" ? 0x1a1a1a : car.color;
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(2, 0.85, 4.2),
-      new THREE.MeshLambertMaterial({ color: bodyColor })
-    );
-    body.position.y = 0.65;
-    g.add(body);
-    const cabin = new THREE.Mesh(
-      new THREE.BoxGeometry(1.7, 0.7, 2),
-      new THREE.MeshLambertMaterial({ color: 0x182430 })
-    );
-    cabin.position.set(0, 1.35, -0.2);
-    g.add(cabin);
-    const wheelGeo = new THREE.CylinderGeometry(0.42, 0.42, 0.35, 10);
-    const wheelMat = new THREE.MeshLambertMaterial({ color: 0x111111 });
-    const wheels = [];
-    for (const [wx, wz] of [[-0.95, 1.35], [0.95, 1.35], [-0.95, -1.35], [0.95, -1.35]]) {
-      const w = new THREE.Mesh(wheelGeo, wheelMat);
-      w.rotation.z = Math.PI / 2;
-      w.position.set(wx, 0.42, wz);
-      g.add(w);
-      wheels.push(w);
+  // Shot tracer: a short-lived line from muzzle to impact.
+  const tracerGeo = new THREE.BufferGeometry();
+  tracerGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const tracer = new THREE.Line(tracerGeo, new THREE.LineBasicMaterial({ color: 0xffe9a0 }));
+  tracer.visible = false;
+  tracer.frustumCulled = false;
+  scene.add(tracer);
+
+  const carMeshes = new Map();
+  const pedMeshes = new Map();
+  let playerMesh = null;
+  const camState = { yaw: 0, pitch: 0, dist: 10, height: 4.5, snapped: false };
+  const tmpTarget = new THREE.Vector3();
+
+  function carMeshFor(car) {
+    let mesh = carMeshes.get(car);
+    if (!mesh) {
+      mesh = makeCarMesh(car.color, car.kind === 'police');
+      scene.add(mesh);
+      carMeshes.set(car, mesh);
     }
-    const headMat = new THREE.MeshBasicMaterial({ color: 0xfff6c0 });
-    for (const hx of [-0.6, 0.6]) {
-      const h = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.25, 0.1), headMat);
-      h.position.set(hx, 0.7, 2.12);
-      g.add(h);
-    }
-    if (car.kind === "police") {
-      const barR = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.25, 0.5), new THREE.MeshBasicMaterial({ color: 0xff0000 }));
-      barR.position.set(-0.4, 1.85, 0);
-      g.add(barR);
-      const barB = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.25, 0.5), new THREE.MeshBasicMaterial({ color: 0x2266ff }));
-      barB.position.set(0.4, 1.85, 0);
-      g.add(barB);
-      g.userData.barR = barR;
-      g.userData.barB = barB;
-    }
-    g.userData.wheels = wheels;
-    return g;
+    return mesh;
   }
 
-  makePedMesh(ped) {
-    const g = new THREE.Group();
-    const body = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.32, 0.4, 1.1, 8),
-      new THREE.MeshLambertMaterial({ color: ped.color })
-    );
-    body.position.y = 0.85;
-    g.add(body);
-    const head = new THREE.Mesh(
-      new THREE.SphereGeometry(0.28, 10, 8),
-      new THREE.MeshLambertMaterial({ color: 0xd9a066 })
-    );
-    head.position.y = 1.65;
-    g.add(head);
-    return g;
+  function pedMeshFor(ped) {
+    let mesh = pedMeshes.get(ped);
+    if (!mesh) {
+      mesh = makePersonMesh(ped.color);
+      scene.add(mesh);
+      pedMeshes.set(ped, mesh);
+    }
+    return mesh;
   }
 
-  sync(S, dt) {
-    // Cars: add meshes for new cars, drop them for removed ones.
-    const seen = new Set();
-    for (const car of S.cars) {
-      seen.add(car.id);
-      let mesh = this.carMeshes.get(car.id);
-      if (!mesh) {
-        mesh = this.makeCarMesh(car);
-        this.carMeshes.set(car.id, mesh);
-        this.scene.add(mesh);
+  // Sky and sun for an hour of the day. 6 = dawn, 12 = noon, 18 = sunset, 0 = night.
+  function applyHour(hour) {
+    const dayT = clamp((hour - 6) / 12, 0, 1); // 0 dawn, 1 dusk
+    const elev = Math.sin(dayT * Math.PI); // 0 at dawn/dusk, 1 at noon
+    const night = hour < 5.5 || hour >= 19.5;
+    const dusk = hour >= 16.5 && hour < 19.5;
+    const dawn = hour >= 5.5 && hour < 8;
+    let sky;
+    let sunColor;
+    let sunI;
+    if (night) {
+      sky = new THREE.Color(0x0e1a2e);
+      sunColor = new THREE.Color(0x8aa0c0);
+      sunI = 0.25;
+    } else if (dusk) {
+      sky = new THREE.Color(0xe8863a);
+      sunColor = new THREE.Color(0xff9a3c);
+      sunI = 1.6;
+    } else if (dawn) {
+      sky = new THREE.Color(0xe8a06a);
+      sunColor = new THREE.Color(0xffc080);
+      sunI = 1.4;
+    } else {
+      sky = new THREE.Color(0x8ec4e8);
+      sunColor = new THREE.Color(0xfff0d0);
+      sunI = 2.4;
+    }
+    scene.background = sky;
+    scene.fog.color.copy(sky);
+    sun.color.copy(sunColor);
+    sun.intensity = sunI;
+    hemi.intensity = night ? 0.35 : 0.9;
+    const ang = (dayT * Math.PI);
+    sun.position.set(Math.cos(ang) * 300, 60 + elev * 260, 180);
+    sunDisc.position.set(Math.cos(ang) * 600, 40 + elev * 420, -500);
+    sunDisc.material.color.set(night ? 0xc0d0e8 : dusk ? 0xff7a2a : 0xffd27a);
+    for (const head of lampHeads) {
+      head.material.color.set(night || dusk ? 0xffe9a0 : 0x8a8a7a);
+    }
+  }
+
+  function sync(state, dt, time) {
+    applyHour(state.hour);
+    // Ocean breathing.
+    ocean.material.opacity = 0.88 + Math.sin(time * 0.5) * 0.04;
+    ocean.position.x = Math.sin(time * 0.08) * 6;
+    for (const cloud of clouds) {
+      cloud.position.x += dt * 1.2;
+      if (cloud.position.x > 380) cloud.position.x = -380;
+    }
+
+    // Player: a person on foot, or hidden inside the driven car.
+    if (!state.player.inCar) {
+      if (!playerMesh) {
+        playerMesh = makePersonMesh(0x2a6ac0);
+        scene.add(playerMesh);
       }
+      playerMesh.visible = true;
+      playerMesh.position.set(state.player.x, 0, state.player.z);
+      playerMesh.rotation.y = state.player.heading;
+      const swing = Math.sin(state.player.walkPhase || 0) * (state.player.speed > 0.5 ? 0.55 : 0);
+      playerMesh.getObjectByName('legL').rotation.x = swing;
+      playerMesh.getObjectByName('legR').rotation.x = -swing;
+      playerMesh.getObjectByName('armL').rotation.x = -swing;
+      playerMesh.getObjectByName('armR').rotation.x = swing;
+    } else if (playerMesh) {
+      playerMesh.visible = false;
+    }
+
+    // Every car: traffic, parked, police and the player's.
+    const allCars = [];
+    if (state.playerCar) allCars.push(state.playerCar);
+    for (const c of state.traffic) allCars.push(c);
+    for (const c of state.parked) allCars.push(c);
+    for (const c of state.police) allCars.push(c);
+    for (const car of allCars) {
+      const mesh = carMeshFor(car);
+      mesh.visible = true;
       mesh.position.set(car.x, 0, car.z);
-      mesh.rotation.y = car.angle;
-      const spin = car.speed * dt * 2;
-      for (const w of mesh.userData.wheels) w.rotation.x += spin;
-      if (car.kind === "police" && mesh.userData.barR) {
-        const on = Math.sin(S.time * 9) > 0;
-        mesh.userData.barR.material.color.setHex(on ? 0xff0000 : 0x550000);
-        mesh.userData.barB.material.color.setHex(on ? 0x002266 : 0x2266ff);
+      mesh.rotation.y = car.heading;
+      if (car.disabled) mesh.rotation.z = 0.12;
+      if (car.kind === 'police') {
+        const phase = Math.floor(time * 6) % 2 === 0;
+        const red = mesh.getObjectByName('sirenRed');
+        const blue = mesh.getObjectByName('sirenBlue');
+        if (red) red.material.color.set(phase ? 0xff2020 : 0x550000);
+        if (blue) blue.material.color.set(phase ? 0x550000 : 0x2040ff);
       }
     }
-    for (const [id, mesh] of this.carMeshes) {
-      if (!seen.has(id)) {
-        this.scene.remove(mesh);
-        this.carMeshes.delete(id);
-      }
-    }
+
     // Pedestrians.
-    const seenP = new Set();
-    S.peds.forEach((ped, i) => {
-      seenP.add(i);
-      let mesh = this.pedMeshes.get(i);
-      if (!mesh) {
-        mesh = this.makePedMesh(ped);
-        this.pedMeshes.set(i, mesh);
-        this.scene.add(mesh);
-      }
-      mesh.position.set(ped.x, ped.state === "down" ? 0.25 : 0, ped.z);
-      mesh.rotation.y = ped.angle;
-      mesh.rotation.z = ped.state === "down" ? Math.PI / 2 : 0;
-      mesh.visible = ped.state !== "down" || true;
-    });
-    // Player on foot.
-    if (!this.playerMesh) {
-      this.playerMesh = this.makePedMesh({ color: 0x27ae60 });
-      this.scene.add(this.playerMesh);
+    for (const ped of state.peds) {
+      const mesh = pedMeshFor(ped);
+      mesh.visible = ped.alive;
+      if (!ped.alive) continue;
+      mesh.position.set(ped.x, 0, ped.z);
+      mesh.rotation.y = ped.heading;
+      const swing = Math.sin(ped.walkPhase || 0) * 0.5;
+      mesh.getObjectByName('legL').rotation.x = swing;
+      mesh.getObjectByName('legR').rotation.x = -swing;
+      mesh.getObjectByName('armL').rotation.x = -swing;
+      mesh.getObjectByName('armR').rotation.x = swing;
     }
-    this.playerMesh.visible = S.player.onFoot;
-    if (S.player.onFoot) {
-      this.playerMesh.position.set(S.player.x, 0, S.player.z);
-      this.playerMesh.rotation.y = S.player.angle;
-    }
+
     // Helicopter.
-    this.heli.visible = S.heli.active;
-    if (S.heli.active) {
-      this.heli.position.set(S.heli.x, S.heli.y, S.heli.z);
-      this.heli.rotation.y = S.heli.angle + Math.PI / 2;
-      this.rotor.rotation.y += dt * 22;
+    if (state.heli && state.heli.active) {
+      heli.visible = true;
+      heli.position.set(state.heli.x, state.heli.y, state.heli.z);
+      heli.rotation.y = state.heli.angle + Math.PI / 2;
+      const rotorMesh = heli.getObjectByName('rotor');
+      if (rotorMesh) rotorMesh.rotation.y += dt * 22;
+    } else {
+      heli.visible = false;
     }
+
     // Mission beacon.
-    let bx = 0, bz = 0, show = false;
-    if (S.mission.active) {
-      const m = MISSIONS[S.mission.index];
-      const step = m && m.steps[S.mission.step];
-      if (step && step.x !== undefined && step.type !== "survive") {
-        bx = step.x;
-        bz = step.z;
-        show = true;
-      }
+    if (state.objective && state.objective.x !== undefined) {
+      beacon.visible = true;
+      beacon.position.set(state.objective.x, 0, state.objective.z);
+      const pulse = 0.22 + Math.sin(time * 3) * 0.08;
+      pillar.material.opacity = pulse;
+      ring.scale.setScalar(1 + Math.sin(time * 2) * 0.15);
+    } else {
+      beacon.visible = false;
     }
-    this.beacon.visible = show;
-    if (show) {
-      this.beacon.position.set(bx, 0, bz);
-      this.beacon.children[0].material.opacity = 0.22 + Math.sin(S.time * 4) * 0.08;
+
+    // Shot tracer.
+    if (state.tracer && state.tracer.life > 0) {
+      tracer.visible = true;
+      const pos = tracer.geometry.attributes.position;
+      pos.setXYZ(0, state.tracer.x1, 1.2, state.tracer.z1);
+      pos.setXYZ(1, state.tracer.x2, 1.2, state.tracer.z2);
+      pos.needsUpdate = true;
+    } else {
+      tracer.visible = false;
     }
-    // Ocean shimmer and the sun.
-    this.ocean.position.y = 0.1 + Math.sin(S.time * 0.7) * 0.08;
-    const sky = skyAt(S.clock);
-    this.scene.background = sky.color;
-    this.scene.fog.color.copy(sky.color);
-    this.sun.intensity = sky.sun;
-    const h = ((S.clock / 3600) % 24) / 24;
-    const ang = (h - 0.25) * Math.PI * 2;
-    this.sun.position.set(Math.cos(ang) * 200, Math.max(20, Math.sin(ang) * 220), 80);
-    this.renderer.render(this.scene, this.camera);
+
+    updateCamera(state, dt);
+    renderer.render(scene, camera);
   }
 
-  followCamera(S, dt, snap, pose) {
-    if (pose) {
-      this.camera.position.set(pose.pos[0], pose.pos[1], pose.pos[2]);
-      this.camera.lookAt(pose.target[0], pose.target[1], pose.target[2]);
+  function updateCamera(state, dt) {
+    if (state.camMode === 'title') {
+      const t = state.titleTime || 0;
+      camera.position.set(Math.cos(t * 0.05) * 160, 55, Math.sin(t * 0.05) * 160);
+      camera.lookAt(0, 0, 25);
       return;
     }
-    const p = S.player;
-    const dist = p.onFoot ? 8.5 : 12;
-    const height = p.onFoot ? 3.6 : 5.2;
-    const fx = Math.sin(p.angle);
-    const fz = Math.cos(p.angle);
-    const tx = p.x - fx * dist;
-    const tz = p.z - fz * dist;
-    if (snap) {
-      this.camera.position.set(tx, height, tz);
+    const target = state.player.inCar && state.playerCar ? state.playerCar : state.player;
+    const heading = target.heading;
+    const yaw = heading + Math.PI + (state.camYaw || 0);
+    const dist = state.player.inCar ? 12 : 8;
+    const height = state.player.inCar ? 5 : 4.2;
+    const cx = target.x + Math.sin(yaw) * dist;
+    const cz = target.z + Math.cos(yaw) * dist;
+    tmpTarget.set(target.x, 1.2, target.z);
+    if (camState.snapped) {
+      camera.position.set(cx, height, cz);
+      camera.lookAt(tmpTarget);
+      camState.snapped = false;
     } else {
-      const k = 1 - Math.exp(-dt * 5);
-      this.camera.position.x += (tx - this.camera.position.x) * k;
-      this.camera.position.y += (height - this.camera.position.y) * k;
-      this.camera.position.z += (tz - this.camera.position.z) * k;
+      const k = 1 - Math.exp(-dt * 4.5);
+      camera.position.x += (cx - camera.position.x) * k;
+      camera.position.y += (height - camera.position.y) * k;
+      camera.position.z += (cz - camera.position.z) * k;
+      camera.lookAt(tmpTarget);
     }
-    this.camera.lookAt(p.x + fx * 7, 1.6, p.z + fz * 7);
   }
+
+  function snapCamera() {
+    camState.snapped = true;
+  }
+
+  function resize(w, h) {
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h, false);
+  }
+
+  return {
+    renderer,
+    scene,
+    camera,
+    sync,
+    snapCamera,
+    resize,
+    applyHour,
+  };
 }
