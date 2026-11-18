@@ -1,1 +1,1 @@
-{"type":"module"}
+{"description":"Solmar Heat — an open-world crime game in the browser, built for make.fun's GTA 6 bounty","name":"solmar-heat","private":true,"scripts":{"build":"mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts","serve":"node serve.ts","simtest":"node tools/simtest.mjs"},"type":"module","version":"1.0.0"}
