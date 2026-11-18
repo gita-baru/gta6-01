@@ -1,173 +1,131 @@
-// Solmar Heat — headless play test: start the game, walk, steal a car, drive,
-// start a mission, shoot, and confirm the state changes. No screenshots.
-// Run: SHOT_CHROME=<path to chrome> node tools/playtest.mjs
-import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
-
+// Headless playtest for Solmar Heat: loads the game in Chromium, starts it,
+// walks, steals a car, drives, starts a mission and checks the police respond
+// — the same systems the screenshots show, exercised end to end.
+//   SHOT_CHROME=/path/to/chrome node tools/playtest.mjs
+import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-let chromium = null;
-for (const p of [
-  "/home/hatch/.npm/_npx/f0a362733743bae2/node_modules/playwright-core",
-  "/home/hatch/.npm/_npx/e41f203b7505f1fb/node_modules/playwright-core",
-  "playwright-core",
-]) {
-  try {
-    chromium = require(p).chromium;
-    break;
-  } catch {
-    // Try the next location.
-  }
-}
-if (!chromium) {
-  console.error("playwright-core not found");
-  process.exit(1);
-}
+const { chromium } = require(
+  process.env.PLAYWRIGHT_CORE ||
+    '/home/hatch/workspace/makefun/pw-tools/node_modules/playwright-core',
+);
 
-const CHROME = process.env.SHOT_CHROME || `${process.env.HOME}/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome`;
-const BASE = process.env.SHOT_URL || "http://localhost:8080";
-
-function waitForServer(url, timeoutMs = 20000) {
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const tick = async () => {
-      try {
-        const res = await fetch(url);
-        if (res.ok) return resolve(true);
-      } catch {
-        // Not up yet.
-      }
-      if (Date.now() - start > timeoutMs) return reject(new Error("server did not start"));
-      setTimeout(tick, 300);
-    };
-    tick();
-  });
-}
-
-const server = spawn("node", ["serve.ts"], {
-  cwd: new URL("..", import.meta.url).pathname,
-  stdio: ["ignore", "pipe", "pipe"],
-  env: { ...process.env, PORT: "8080" },
-});
+const chromePath =
+  process.env.SHOT_CHROME ||
+  '/home/hatch/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome';
+const base = process.env.SHOT_BASE || 'http://localhost:8080';
 
 let passed = 0;
 let failed = 0;
-function check(name, cond, extra = "") {
+function check(name, cond) {
   if (cond) {
     passed++;
-    console.log(`  ok ${name}`);
+    console.log(`ok: ${name}`);
   } else {
     failed++;
-    console.log(`  FAIL ${name} ${extra}`);
+    console.log(`FAIL: ${name}`);
   }
 }
 
+const browser = await chromium.launch({
+  executablePath: chromePath,
+  headless: true,
+  args: ['--use-angle=swiftshader', '--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'],
+});
+const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push(String(e.message || e)));
+page.on('console', (m) => {
+  if (m.type() === 'error') errors.push(m.text());
+});
+await page.goto(`${base}/`, { waitUntil: 'load', timeout: 60000 });
+await page.waitForFunction(() => window.__game !== undefined, null, { timeout: 30000 });
+check('game object loads', true);
+check('title screen visible', await page.isVisible('#screen-title'));
+check('no errors on load', errors.length === 0 && (await page.evaluate(() => window.__gameErrors.length)) === 0);
+
+await page.click('#btn-start');
+await page.waitForTimeout(800);
+check('start button enters play mode', (await page.evaluate(() => window.__game.state.mode)) === 'playing');
+check('HUD shows after start', await page.isVisible('#hud'));
+
+// Walk forward: the player should move. Headless swiftshader renders the
+// 3D scene slowly, so frames are sparse and game time runs well behind wall
+// time (dt is clamped to 0.05s/frame) — wait for the movement itself rather
+// than assuming a fixed wall-clock window.
+const before = await page.evaluate(() => ({ x: window.__game.state.player.x, z: window.__game.state.player.z }));
+await page.keyboard.down('KeyW');
+let walked = false;
 try {
-  await waitForServer(BASE + "/");
-  const browser = await chromium.launch({
-    executablePath: CHROME,
-    headless: true,
-    args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--no-sandbox", "--disable-dev-shm-usage"],
-  });
-  const page = await browser.newPage({ viewport: { width: 960, height: 540 } });
-  const errors = [];
-  page.on("pageerror", (e) => errors.push(String(e)));
-  await page.goto(BASE + "/", { waitUntil: "load", timeout: 30000 });
-  await page.waitForTimeout(2500);
-  check("page loads without errors", errors.length === 0, errors.join("; "));
-  check("title screen shows", await page.evaluate(() => document.getElementById("title-screen").style.display === "flex"));
-  const state = () => page.evaluate(() => {
-    const S = window.__game;
-    return {
-      state: S.state,
-      onFoot: S.player.onFoot,
-      x: S.player.x,
-      z: S.player.z,
-      wanted: S.wanted,
-      mission: S.mission.active,
-      money: S.money,
-      ammo: S.ammo,
-    };
-  });
-  // Start the game (poll: headless frames are slow).
-  async function waitFor(pred, timeoutMs = 15000, label = "") {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const s = await state();
-      if (pred(s)) return s;
-      await page.waitForTimeout(400);
-    }
-    return await state();
-  }
-  await page.keyboard.press("Enter");
-  check("Enter starts the game", (await waitFor((s) => s.state === "playing")).state === "playing");
-  // Walk forward until the player has actually moved (headless SwiftShader
-  // renders slowly, so wall-clock waits understate game time — poll instead).
-  const before = await state();
-  async function movedMoreThan(minDist, timeoutMs = 25000) {
-    const start = Date.now();
-    let best = 0;
-    while (Date.now() - start < timeoutMs) {
-      const s = await state();
-      best = Math.hypot(s.x - before.x, s.z - before.z);
-      if (best >= minDist) return best;
-      await page.waitForTimeout(400);
-    }
-    return best;
-  }
-  await page.keyboard.down("KeyW");
-  const walked = await movedMoreThan(5);
-  await page.keyboard.up("KeyW");
-  check("player walks", walked > 5, `moved ${walked.toFixed(1)}m`);
-  // Teleport next to a parked car (test hook) and steal it.
-  await page.evaluate(() => {
-    const S = window.__game;
-    const car = S.cars.find((c) => c.kind === "parked");
-    S.player.x = car.x + 2;
-    S.player.z = car.z;
-  });
-  await page.keyboard.press("KeyE");
-  const inCar = await waitFor((s) => s.onFoot === false);
-  check("E steals a car", inCar.onFoot === false);
-  check("stealing raises wanted", inCar.wanted > 0, `wanted ${inCar.wanted}`);
-  // Drive until the car has actually covered ground.
-  const d0 = await state();
-  async function droveMoreThan(minDist, timeoutMs = 25000) {
-    const start = Date.now();
-    let best = 0;
-    while (Date.now() - start < timeoutMs) {
-      const s = await state();
-      best = Math.hypot(s.x - d0.x, s.z - d0.z);
-      if (best >= minDist) return best;
-      await page.waitForTimeout(400);
-    }
-    return best;
-  }
-  await page.keyboard.down("KeyW");
-  const drove = await droveMoreThan(10);
-  await page.keyboard.up("KeyW");
-  check("car drives", drove > 10, `drove ${drove.toFixed(1)}m`);
-  // Start a mission.
-  await page.keyboard.press("KeyT");
-  check("T starts a mission", (await waitFor((s) => s.mission === true)).mission === true);
-  // Shoot once (poll: headless frames are slow, so a fixed wait is too short).
-  const a0 = (await state()).ammo;
-  await page.mouse.click(480, 270);
-  let ammoNow = a0;
-  const shotStart = Date.now();
-  while (Date.now() - shotStart < 10000 && ammoNow === a0) {
-    await page.waitForTimeout(400);
-    ammoNow = (await state()).ammo;
-  }
-  check("click shoots", ammoNow === a0 - 1, `ammo ${a0} -> ${ammoNow}`);
-  // Pause and resume.
-  await page.keyboard.press("Escape");
-  check("Esc pauses", (await waitFor((s) => s.state === "paused")).state === "paused");
-  await page.keyboard.press("Escape");
-  check("Esc resumes", (await waitFor((s) => s.state === "playing")).state === "playing");
-  await browser.close();
-} finally {
-  server.kill();
+  await page.waitForFunction(
+    (b) => {
+      const p = window.__game.state.player;
+      return Math.hypot(p.x - b.x, p.z - b.z) > 2;
+    },
+    before,
+    { timeout: 20000 },
+  );
+  walked = true;
+} catch {
+  walked = false;
 }
+await page.keyboard.up('KeyW');
+check('player walks with W', walked);
 
+// Minimap is actually drawn (pixels are not all one colour).
+const mapDrawn = await page.evaluate(() => {
+  const c = document.getElementById('minimap');
+  const ctx = c.getContext('2d');
+  const data = ctx.getImageData(0, 0, c.width, c.height).data;
+  const colours = new Set();
+  for (let i = 0; i < data.length; i += 400) colours.add(`${data[i]},${data[i + 1]},${data[i + 2]}`);
+  return colours.size > 8;
+});
+check('minimap draws the city', mapDrawn);
+check('HUD money shows', (await page.textContent('#hud-money')).includes('$'));
+
+// Steal a parked car: teleport beside one, press E, drive off.
+await page.evaluate(() => {
+  const g = window.__game;
+  const car = g.state.parked[0];
+  g.state.player.x = car.x + 2;
+  g.state.player.z = car.z;
+});
+await page.keyboard.press('KeyE');
+await page.waitForTimeout(400);
+check('entering a car works', await page.evaluate(() => window.__game.state.player.inCar === true));
+check('stealing raises wanted', (await page.evaluate(() => window.__game.state.wanted)) >= 1);
+const speedBefore = await page.evaluate(() => window.__game.state.playerCar.speed);
+await page.keyboard.down('KeyW');
+let accelerated = false;
+try {
+  await page.waitForFunction(
+    (sb) => {
+      const s = window.__game.state.playerCar.speed;
+      return s > 5 && s > sb;
+    },
+    speedBefore,
+    { timeout: 20000 },
+  );
+  accelerated = true;
+} catch {
+  accelerated = false;
+}
+await page.keyboard.up('KeyW');
+check('car accelerates', accelerated);
+
+// A mission starts with T and shows an objective.
+await page.keyboard.press('KeyT');
+await page.waitForTimeout(400);
+check('mission starts with T', (await page.evaluate(() => window.__game.state.missions.active !== null)));
+check('objective text shows', (await page.textContent('#hud-objective')).length > 3);
+
+// Wanted police actually spawn and chase.
+await page.evaluate(() => window.__game.setWanted(3));
+await page.waitForTimeout(2500);
+const police = await page.evaluate(() => window.__game.state.police.length);
+check('police spawn at 3 stars', police >= 2);
+check('no errors during play', errors.length === 0 && (await page.evaluate(() => window.__gameErrors.length)) === 0);
+
+await browser.close();
 console.log(`\nplaytest: ${passed} passed, ${failed} failed`);
-process.exit(failed ? 1 : 0);
+if (failed > 0) process.exit(1);

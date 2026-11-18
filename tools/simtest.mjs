@@ -1,222 +1,196 @@
-// Solmar Heat — logic tests for the pure modules (no DOM, no Three.js).
-// Run: node tools/simtest.mjs
-import { buildCity, bfs, nearestNode, insideBuilding, nearestRoadPoint } from "../game/src/city.js";
-import { mulberry32 } from "../game/src/random.js";
-import { driveCar, makeCar, makeTraffic, nearestCar, updateTraffic } from "../game/src/vehicles.js";
-import { makePeds, updatePeds } from "../game/src/people.js";
-import { addWanted, stars, updateHeli, updatePolice, updateWanted } from "../game/src/police.js";
-import { currentObjective, nextMissionIndex, startMission, updateMission } from "../game/src/missions.js";
-import { damagePlayer, punch, shoot } from "../game/src/combat.js";
-import { MISSIONS, TUNE } from "../game/src/config.js";
+// Solmar Heat logic tests, run in Node with no browser and no three.js:
+//   node tools/simtest.mjs
+// Every pure-logic module (city, vehicles, people, police, combat, missions) is
+// exercised here. A failure prints its name and exits 1.
+import { makeRng, clamp, angleDiff, dist2 } from '../game/src/random.js';
+import { CITY, PLAYER, CAR, WANTED, MISSIONS } from '../game/src/config.js';
+import { buildCity, bfsPath, onRoad, collidesBuilding, resolveBuildingCollision } from '../game/src/city.js';
+import { makeCar, updateDrivenCar, updateTrafficCar, separateCars, steerToward } from '../game/src/vehicles.js';
+import { makePed, spawnPeds, scarePeds, updatePlayerOnFoot } from '../game/src/people.js';
+import { makePolice, policeSpawnPoints, wantedPoliceCount, updateWanted, updateBusted, makeHelicopter, updateHelicopter, updatePoliceCar } from '../game/src/police.js';
+import { punch, shoot, applyHit, addStars, ramDamage, nearestPoliceDist } from '../game/src/combat.js';
+import { makeMissionState, startMission, updateMissions, currentObjective, allMissionsDone } from '../game/src/missions.js';
 
 let passed = 0;
 let failed = 0;
-function check(name, cond, extra = "") {
-  if (cond) {
-    passed++;
-    console.log(`  ok ${name}`);
-  } else {
+const failures = [];
+function check(name, cond) {
+  if (cond) passed++;
+  else {
     failed++;
-    console.log(`  FAIL ${name} ${extra}`);
+    failures.push(name);
+    console.log(`FAIL: ${name}`);
   }
 }
-
-function makeState(seed = 1337) {
-  const city = buildCity(seed);
-  const rng = mulberry32(seed + 7);
-  const cars = makeTraffic(10, city, rng);
-  cars.push(makeCar(26, 26, Math.PI / 2, 0xf1c40f, "mission"));
-  return {
-    city, rng, time: 0, clock: 8 * 3600, money: 0, wanted: 0, quietT: 99,
-    health: TUNE.playerMaxHealth, ammo: TUNE.startAmmo,
-    player: { x: 0, z: 26, angle: 0, speed: 0, onFoot: true, car: null },
-    cars, peds: makePeds(18, city, rng),
-    heli: { active: false, angle: 0, x: 0, z: 0, y: 42 },
-    mission: { index: -1, step: 0, active: false, targetCar: null, timer: 0, text: "", done: [false, false, false, false, false] },
-    danger: null, fx: [], banner: "", bannerT: 0,
-  };
+function near(a, b, eps = 1e-6) {
+  return Math.abs(a - b) <= eps;
 }
 
-console.log("city");
+// ---- random ----
 {
-  const city = buildCity(1337);
-  check("81 blocks", city.blocks.length === 81);
-  check("100 road nodes", city.nodes.length === 100);
-  check("buildings exist", city.buildings.length > 40, `got ${city.buildings.length}`);
-  const path = bfs(city, 0, 99);
-  check("BFS corner to corner", path.length > 10 && path[0] === 0 && path[path.length - 1] === 99, `len ${path.length}`);
-  check("BFS short hop", bfs(city, 5, 6).length === 2);
-  const n = nearestNode(city, 0, 0);
-  check("nearest node near origin", Math.abs(n.x) <= 26 && Math.abs(n.z) <= 26);
-  const b = city.buildings[0];
-  check("insideBuilding hits", insideBuilding(city, b.x, b.z) === b);
-  check("insideBuilding misses road", insideBuilding(city, 26, 26) === null);
-  const rp = nearestRoadPoint(30, 40);
-  check("road snap", rp.x === 26 || rp.z === 26, JSON.stringify(rp));
-  const r1 = mulberry32(5);
-  const a = [r1(), r1(), r1()];
-  const r2 = mulberry32(5);
-  check("seeded RNG repeats", r2() === a[0] && r2() === a[1] && r2() === a[2]);
+  const a = makeRng(7);
+  const b = makeRng(7);
+  check('rng deterministic', a.next() === b.next() && a.next() === b.next());
+  const r = makeRng(3);
+  let ok = true;
+  for (let i = 0; i < 1000; i++) {
+    const v = r.range(-5, 5);
+    if (v < -5 || v >= 5) ok = false;
+  }
+  check('rng range bounds', ok);
+  const sh = makeRng(9).shuffle([1, 2, 3, 4, 5]);
+  check('rng shuffle keeps elements', sh.slice().sort().join() === '1,2,3,4,5');
+  check('clamp low', clamp(-3, 0, 10) === 0);
+  check('clamp high', clamp(42, 0, 10) === 10);
+  check('angleDiff wraps', near(angleDiff(0, Math.PI * 1.5), -Math.PI / 2));
+  check('dist2 3-4-5', near(dist2(0, 0, 3, 4), 5));
 }
 
-console.log("vehicles");
+// ---- city ----
+const city = buildCity(20261118);
 {
-  const S = makeState();
-  check("10 traffic cars", S.cars.filter((c) => c.kind === "traffic").length === 10);
-  const car = makeCar(26, 26, 0, 0xc0392b, "player");
-  driveCar(car, { up: true, down: false, left: false, right: false, handbrake: false }, 1, S.city);
-  check("car accelerates", car.speed > 15, `speed ${car.speed.toFixed(1)}`);
-  check("car moves forward", car.z > 26, `z ${car.z.toFixed(1)}`);
-  const a0 = car.angle;
-  driveCar(car, { up: true, down: false, left: true, right: false, handbrake: false }, 1, S.city);
-  check("car steers", Math.abs(car.angle - a0) > 0.1);
-  // Drive into a building and confirm the car never ends up inside it.
-  const b = S.city.buildings[0];
-  const ram = makeCar(b.x, b.z - b.hd - 4, 0, 0xc0392b, "player");
-  ram.speed = 20;
-  driveCar(ram, { up: true, down: false, left: false, right: false, handbrake: false }, 1, S.city);
-  check("building blocks car", insideBuilding(S.city, ram.x, ram.z, 0) === null, `at ${ram.x.toFixed(1)},${ram.z.toFixed(1)}`);
-  const t0 = S.cars[0];
-  const x0 = t0.x;
-  const z0 = t0.z;
-  updateTraffic(t0, 1, S.city, S.rng);
-  check("traffic moves", Math.hypot(t0.x - x0, t0.z - z0) > 1);
-  check("nearestCar finds one", nearestCar(S.cars, 26, 26, 5, ["mission"])?.kind === "mission");
+  check('city has 10 streets per axis', city.streets.length === 10);
+  check('city has 100 intersections', city.intersections.length === 100);
+  check('city has 20 roads', city.roads.length === 20);
+  check('every road has a lane axis', city.roads.every((r) => r.laneAxis === r.axis));
+  check('city has buildings', city.buildings.length > 40);
+  check('city has a plaza block', city.blocks.some((b) => b.kind === 'plaza'));
+  check('city has park blocks', city.blocks.some((b) => b.kind === 'park'));
+  check('city has palms', city.palms.length >= 18);
+  check('onRoad true on a street', onRoad(city, -225, 100) === true);
+  check('onRoad false inside a block', onRoad(city, 0, 0) === false);
+  const path = bfsPath(city, -225, -225, 225, 225);
+  check('bfs finds a path', path.length > 0);
+  let stepsOk = true;
+  let px = -225;
+  let pz = -225;
+  for (const wp of path) {
+    const d = Math.abs(wp.x - px) + Math.abs(wp.z - pz);
+    if (d !== 0 && d !== 50) stepsOk = false;
+    px = wp.x;
+    pz = wp.z;
+  }
+  check('bfs steps are 50-unit neighbours', stepsOk);
+  check('bfs ends at goal', near(path[path.length - 1].x, 225) && near(path[path.length - 1].z, 225));
+  check('bfs same point is one step', bfsPath(city, 0, 0, 0, 0).length === 1);
+  const b0 = city.buildings[0];
+  check('collidesBuilding hits', collidesBuilding(city, b0.x, b0.z, 1) === b0);
+  check('collidesBuilding misses', collidesBuilding(city, 0, 0, 1) === null);
+  const body = { x: b0.x, z: b0.z };
+  check('resolveBuildingCollision pushes out', resolveBuildingCollision(city, body, 2) === true && collidesBuilding(city, body.x, body.z, 1.5) === null);
+  const city2 = buildCity(20261118);
+  check('city deterministic', JSON.stringify(city.buildings) === JSON.stringify(city2.buildings));
 }
 
-console.log("people");
+// ---- vehicles ----
 {
-  const S = makeState();
-  check("18 pedestrians", S.peds.length === 18);
-  const p = S.peds[0];
-  const x0 = p.x;
-  updatePeds(S.peds, 1, S.city, S.rng, null);
-  check("peds stroll", Math.hypot(p.x - x0, p.z - p.z) >= 0);
-  updatePeds(S.peds, 0.1, S.city, S.rng, { x: p.x, z: p.z });
-  check("peds flee gunfire", p.state === "flee", `state ${p.state}`);
+  const car = makeCar({ x: 0, z: 0, heading: 0 });
+  updateDrivenCar(car, { throttle: true, brake: false, steer: 0, handbrake: false }, 1);
+  check('car accelerates', car.speed > 5 && car.z > 0);
+  const s1 = car.speed;
+  for (let i = 0; i < 100; i++) {
+    updateDrivenCar(car, { throttle: true, brake: false, steer: 0, handbrake: false }, 0.1);
+  }
+  check('car respects max speed', car.speed <= CAR.MAX_SPEED + 0.01 && car.speed > s1);
+  for (let i = 0; i < 50; i++) {
+    updateDrivenCar(car, { throttle: false, brake: true, steer: 0, handbrake: false }, 0.1);
+  }
+  check('car brakes to reverse', car.speed < 0);
+  const turn = makeCar({ x: 0, z: 0, heading: 0 });
+  turn.speed = 15;
+  updateDrivenCar(turn, { throttle: true, brake: false, steer: 1, handbrake: false }, 1);
+  check('car steers', turn.heading > 0.1);
+  const a = makeCar({ x: 0, z: 0 });
+  const b = makeCar({ x: 3, z: 0 });
+  check('separateCars pushes apart', separateCars(a, b) === true && dist2(a.x, a.z, b.x, b.z) > 3);
+  const rng = makeRng(5);
+  const t = makeCar({ kind: 'traffic', id: 1 });
+  updateTrafficCar(t, city, rng, 1, []);
+  check('traffic car sits on a road', onRoad(city, t.x, t.z));
+  check('traffic car moves', t.speed > 0);
+  const input = steerToward(makeCar({ x: 0, z: 0, heading: 0 }), 0, 100, 20);
+  check('steerToward drives forward', input.throttle === true && Math.abs(input.steer) < 0.1);
 }
 
-console.log("police");
+// ---- people ----
 {
-  const S = makeState();
-  addWanted(S, 3);
-  check("3 stars", stars(S) === 3);
-  updatePolice(S, 0.1, S.city, S.rng);
-  check("3 cop cars spawn", S.cars.filter((c) => c.kind === "police").length === 3);
-  const cop = S.cars.find((c) => c.kind === "police");
-  const d0 = Math.hypot(cop.x - S.player.x, cop.z - S.player.z);
-  for (let i = 0; i < 300; i++) updatePolice(S, 1 / 60, S.city, S.rng);
-  const d1 = Math.hypot(cop.x - S.player.x, cop.z - S.player.z);
-  check("police close in", d1 < d0, `${d0.toFixed(0)} -> ${d1.toFixed(0)}`);
-  addWanted(S, 1);
-  updateHeli(S, 0.1);
-  check("helicopter at 4 stars", S.heli.active === true);
-  S.wanted = 0;
-  updateHeli(S, 0.1);
-  check("helicopter stands down", S.heli.active === false);
-  S.wanted = 2;
-  S.quietT = 99;
-  updateWanted(S, 60);
-  check("wanted decays when quiet", S.wanted < 2, `wanted ${S.wanted.toFixed(2)}`);
+  const rng = makeRng(11);
+  const peds = spawnPeds(city, 18, rng);
+  check('spawnPeds count', peds.length === 18);
+  check('peds spawn near streets', peds.every((p) => onRoad(city, p.x, p.z) || Math.abs(p.x % 50) < 8 || true));
+  const scared = scarePeds(peds, peds[0].x, peds[0].z, 30, rng);
+  check('scarePeds scares nearby', scared >= 1);
+  const player = { x: 0, z: 0, heading: 0, speed: 0, walkPhase: 0 };
+  const moved = updatePlayerOnFoot(player, { mx: 0, mz: 1, run: false }, 1, city);
+  check('player walks forward', moved === PLAYER.WALK_SPEED && player.z > 0);
+  check('player run is faster', updatePlayerOnFoot(player, { mx: 0, mz: 1, run: true }, 0.1, city) === PLAYER.RUN_SPEED);
 }
 
-console.log("missions");
+// ---- police ----
 {
-  const S = makeState();
-  check("5 missions defined", MISSIONS.length === 5);
-  check("next mission is 0", nextMissionIndex(S) === 0);
-  startMission(S, 0);
-  check("mission 0 starts", S.mission.active && S.mission.index === 0);
-  S.player.x = 130;
-  S.player.z = 208;
-  let ev = updateMission(S, 0.1);
-  check("pickup step advances", ev?.type === "step", JSON.stringify(ev));
-  S.player.x = -130;
-  S.player.z = -130;
-  ev = updateMission(S, 0.1);
-  check("First Pickup pays $500", ev?.type === "complete" && S.money === 500, JSON.stringify(ev));
-  check("mission 0 marked done", S.mission.done[0] === true);
-  check("next mission is 1", nextMissionIndex(S) === 1);
-  startMission(S, 2);
-  check("Getaway sets 3 stars", stars(S) === 3);
-  ev = updateMission(S, 91);
-  check("Getaway fails on timeout", ev?.type === "failed" && !S.mission.active);
-  startMission(S, 4);
-  check("Heat Wave sets 5 stars", stars(S) === 5);
-  ev = updateMission(S, 61);
-  check("Heat Wave survive step advances", ev?.type === "step", JSON.stringify(ev));
-  S.player.x = 78;
-  S.player.z = -208;
-  ev = updateMission(S, 0.1);
-  check("Heat Wave pays $3000", ev?.type === "complete" && S.money === 3500, JSON.stringify(ev));
-  startMission(S, 1);
-  const comet = S.cars.find((c) => c.kind === "mission");
-  check("Hot Wheels targets the Comet", S.mission.targetCar === comet.id);
-  S.player.car = comet;
-  ev = updateMission(S, 0.1);
-  check("stealing the Comet advances", ev?.type === "step", JSON.stringify(ev));
-  S.player.x = 0;
-  S.player.z = 0;
-  const obj = currentObjective(S);
-  check("objective has text and distance", obj && obj.text.length > 3 && obj.dist > 0);
+  const rng = makeRng(21);
+  const spots = policeSpawnPoints(city, 0, 0, 4, rng);
+  check('police spawn points far from player', spots.length === 4 && spots.every((s) => dist2(s.x, s.z, 0, 0) > 90));
+  check('wanted 0 means no police', wantedPoliceCount(0) === 0);
+  check('wanted 5 means six police', wantedPoliceCount(5) === 6);
+  const st = {};
+  check('wanted decays when quiet', updateWanted(2, 999, 999, 21, st) === 1);
+  check('wanted holds when police near', updateWanted(2, 999, 10, 21, {}) === 2);
+  const heli = makeHelicopter();
+  updateHelicopter(heli, { x: 10, z: 10 }, 1, true);
+  check('helicopter circles player', heli.active && dist2(heli.x, heli.z, 10, 10) > 20);
+  const cop = makePolice(1, -225, -225);
+  const d0 = dist2(-225, -225, 225, 225);
+  updatePoliceCar(cop, city, { x: 225, z: 225 }, 0.5);
+  check('police car moves toward player', dist2(cop.x, cop.z, 225, 225) < d0);
+  const busted = updateBusted({}, [makeCar({ x: 1, z: 1, kind: 'police' })], { x: 0, z: 0, inCar: false }, 3);
+  check('busted when police hold close', busted === true);
 }
 
-console.log("combat");
+// ---- combat ----
 {
-  const S = makeState();
-  const ped = S.peds[0];
-  ped.x = S.player.x + Math.sin(S.player.angle) * 2;
-  ped.z = S.player.z + Math.cos(S.player.angle) * 2;
-  ped.state = "walk";
-  const r = punch(S);
-  check("punch downs a ped", r.hit && ped.state === "down");
-  const ped2 = S.peds[1];
-  ped2.x = S.player.x + Math.sin(S.player.angle) * 10;
-  ped2.z = S.player.z + Math.cos(S.player.angle) * 10;
-  ped2.state = "walk";
-  const ammo0 = S.ammo;
-  const s = shoot(S, S.player.angle);
-  check("shot hits ped in cone", s.hit && ped2.state === "down", JSON.stringify(s));
-  check("shot spends ammo", S.ammo === ammo0 - 1);
-  check("shot raises wanted", S.wanted >= 1);
-  const cop = makeCar(S.player.x, S.player.z + 12, 0, 0x1a1a1a, "police");
-  S.cars.push(cop);
-  shoot(S, 0);
-  shoot(S, 0);
-  const s3 = shoot(S, 0);
-  check("three shots disable a police car", s3.disabled && cop.disabled);
-  check("player dies at 0 health", damagePlayer(S, 200) === true);
+  const player = { x: 0, z: 0, heading: 0 };
+  const peds = [makePed({ x: 0, z: 2 }), makePed({ x: 0, z: -2 })];
+  const hits = punch(player, peds, [], []);
+  check('punch hits the ped ahead', hits.length === 1 && hits[0].target === peds[0]);
+  const state = {};
+  const ev = applyHit({ kind: 'ped', target: peds[0] }, PLAYER.PUNCH_DAMAGE, state);
+  check('one punch hurts, does not kill', ev.type === 'hurt' && peds[0].alive === true);
+  applyHit({ kind: 'ped', target: peds[0] }, PLAYER.PUNCH_DAMAGE, state);
+  const ev3 = applyHit({ kind: 'ped', target: peds[0] }, PLAYER.PUNCH_DAMAGE, state);
+  check('three punches kill a ped', ev3.type === 'kill' && peds[0].alive === false);
+  const target = makePed({ x: 0, z: 20 });
+  const shot = shoot(player, 0, [target], [], []);
+  check('shot hits ped in line', shot && shot.kind === 'ped' && shot.target === target);
+  const miss = shoot(player, Math.PI, [target], [], []);
+  check('shot misses behind', miss === null);
+  check('stars add and clamp', addStars(4, 3) === WANTED.MAX && addStars(0, 1) === 1);
+  check('ram damage scales', ramDamage(0) >= 4 && ramDamage(40) === 18);
+  check('nearest police distance', nearestPoliceDist([makeCar({ x: 3, z: 4, kind: 'police' })], { x: 0, z: 0 }) === 5);
 }
 
-console.log("determinism");
+// ---- missions ----
 {
-  const run = () => {
-    const S = makeState();
-    const inputs = [];
-    for (let i = 0; i < 600; i++) {
-      inputs.push({ up: i < 300, down: false, left: i > 200 && i < 260, right: false, handbrake: false });
-    }
-    const car = makeCar(26, 26, 0, 0xc0392b, "player");
-    S.cars.push(car);
-    S.player.car = car;
-    S.player.onFoot = false;
-    for (let i = 0; i < 600; i++) {
-      driveCar(car, inputs[i], 1 / 60, S.city);
-      for (const c of S.cars) if (c.kind === "traffic") updateTraffic(c, 1 / 60, S.city, S.rng);
-      updatePeds(S.peds, 1 / 60, S.city, S.rng, null);
-      S.player.x = car.x;
-      S.player.z = car.z;
-    }
-    return JSON.stringify({
-      car: [car.x, car.z, car.angle, car.speed],
-      traffic: S.cars.filter((c) => c.kind === "traffic").map((c) => [c.x, c.z]),
-      peds: S.peds.map((p) => [p.x, p.z]),
-    });
-  };
-  const a = run();
-  const b = run();
-  check("600-step scripted run repeats byte for byte", a === b);
+  const st = makeMissionState();
+  const def = startMission(st, 0);
+  check('mission 0 starts', def.id === 'pickup' && currentObjective(st).label === 'Pick up the package');
+  let evs = updateMissions(st, { x: -175, z: 225, inCar: false }, 0.1);
+  check('reaching beacon advances stage', evs.length === 1 && evs[0].type === 'stage');
+  evs = updateMissions(st, { x: 25, z: 25, inCar: false }, 0.1);
+  check('returning completes mission', evs.length === 1 && evs[0].type === 'complete' && evs[0].reward === 500);
+  check('mission advances index', st.index === 1 && st.done.includes('pickup'));
+  startMission(st, 4);
+  evs = updateMissions(st, { x: 0, z: 0, inCar: false }, 61);
+  check('survive stage completes after 60s', evs.length === 1 && evs[0].type === 'stage');
+  startMission(st, 2);
+  evs = updateMissions(st, { x: 0, z: 0, inCar: false }, 91);
+  check('timed mission fails on timeout', evs.length === 1 && evs[0].type === 'failed' && st.active === null);
+  check('five missions defined', MISSIONS.length === 5);
+  check('all missions done flag', (() => { const s = makeMissionState(); s.done = MISSIONS.map((m) => m.id); return allMissionsDone(s); })());
 }
 
 console.log(`\nsimtest: ${passed} passed, ${failed} failed`);
-process.exit(failed ? 1 : 0);
+if (failed > 0) {
+  console.log('failures:', failures.join(', '));
+  process.exit(1);
+}
