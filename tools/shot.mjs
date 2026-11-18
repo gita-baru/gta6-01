@@ -1,115 +1,104 @@
-// Headless-Chromium screenshot driver over CDP (no dependencies — Node 24
-// has a global WebSocket client). Usage:
-//   SHOT_CHROME=/path/to/chrome node tools/shot.mjs --url <url> --out <file> [--wait ms] [--no-ready]
-// Waits for window.__shot.ready (unless --no-ready), then captures a JPEG and
-// reports the page's error count. Exits non-zero if errors > 0 or on timeout.
-import { spawn } from 'node:child_process';
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+// Solmar Heat — screenshot runner. Serves the game, opens each staged scene
+// in stock Chromium, waits for the camera to settle, and captures 1280x720.
+// Run: SHOT_CHROME=<path to chrome> node tools/shot.mjs
+// Env: SHOT_CHROME overrides the Chromium binary; SHOT_URL overrides the base.
+import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 
-const CHROME = process.env.SHOT_CHROME
-  || '/home/hatch/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome';
-
-const args = process.argv.slice(2);
-const opt = (name, def) => {
-  const i = args.indexOf(name);
-  return i >= 0 && args[i + 1] ? args[i + 1] : def;
-};
-const url = opt('--url');
-const out = opt('--out');
-const waitMs = parseInt(opt('--wait', '5000'), 10);
-const expectReady = !args.includes('--no-ready');
-const timeoutMs = parseInt(opt('--timeout', '45000'), 10);
-if (!url || !out) {
-  console.error('usage: node tools/shot.mjs --url <url> --out <file> [--wait ms] [--no-ready]');
-  process.exit(2);
+const require = createRequire(import.meta.url);
+let chromium = null;
+for (const p of [
+  "/home/hatch/.npm/_npx/f0a362733743bae2/node_modules/playwright-core",
+  "/home/hatch/.npm/_npx/e41f203b7505f1fb/node_modules/playwright-core",
+  "playwright-core",
+]) {
+  try {
+    chromium = require(p).chromium;
+    break;
+  } catch {
+    // Try the next location.
+  }
+}
+if (!chromium) {
+  console.error("playwright-core not found");
+  process.exit(1);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const port = 9333;
-const profile = `/tmp/shot-profile-${process.pid}`;
+const CHROME = process.env.SHOT_CHROME || `${process.env.HOME}/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome`;
+const BASE = process.env.SHOT_URL || "http://localhost:8080";
+const SHOTS = [
+  { name: "chase", file: "screenshots/1-chase.jpg" },
+  { name: "street", file: "screenshots/2-street.jpg" },
+  { name: "mission", file: "screenshots/3-mission.jpg" },
+  { name: "title", file: "screenshots/4-title.jpg" },
+];
 
-const chrome = spawn(CHROME, [
-  '--headless=new', '--no-sandbox', '--disable-gpu',
-  '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-first-run', '--no-default-browser-check',
-  `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
-  '--window-size=1280,720', '--hide-scrollbars', 'about:blank',
-], { stdio: 'ignore' });
-
-async function getJson(path) {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`);
-  return res.json();
-}
-
-let ws = null;
-let msgId = 0;
-const pending = new Map();
-function send(method, params = {}) {
+function waitForServer(url, timeoutMs = 20000) {
+  const start = Date.now();
   return new Promise((resolve, reject) => {
-    const id = ++msgId;
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
+    const tick = async () => {
+      try {
+        const res = await fetch(url);
+        if (res.ok) return resolve(true);
+      } catch {
+        // Not up yet.
+      }
+      if (Date.now() - start > timeoutMs) return reject(new Error("server did not start"));
+      setTimeout(tick, 300);
+    };
+    tick();
   });
 }
-async function evaluate(expression) {
-  const res = await send('Runtime.evaluate', { expression, returnByValue: true });
-  return res?.result?.value;
-}
 
-let code = 0;
+const server = spawn("node", ["serve.ts"], {
+  cwd: new URL("..", import.meta.url).pathname,
+  stdio: ["ignore", "pipe", "pipe"],
+  env: { ...process.env, PORT: "8080" },
+});
+server.stdout.on("data", (d) => process.stdout.write("[serve] " + d));
+server.stderr.on("data", (d) => process.stderr.write("[serve] " + d));
+
+const results = [];
 try {
-  // Wait for DevTools to answer.
-  let version = null;
-  for (let i = 0; i < 60; i++) {
-    try { version = await getJson('/json/version'); break; } catch { await sleep(500); }
-  }
-  if (!version) throw new Error('DevTools did not come up');
-
-  const targets = await getJson('/json/list');
-  const page = targets.find((t) => t.type === 'page');
-  if (!page) throw new Error('no page target');
-  ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
+  await waitForServer(BASE + "/");
+  const browser = await chromium.launch({
+    executablePath: CHROME,
+    headless: true,
+    args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--no-sandbox", "--disable-dev-shm-usage"],
   });
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id).resolve(msg.result);
-      pending.delete(msg.id);
-    }
-  };
-  await send('Page.enable');
-  await send('Runtime.enable');
-  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
-  await send('Page.navigate', { url });
-  await sleep(1500);
-
-  let ready = false;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  for (const shot of SHOTS) {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+    const errors = [];
+    page.on("pageerror", (e) => errors.push(String(e)));
+    page.on("console", (m) => {
+      if (m.type() === "error") errors.push(m.text());
+    });
+    await page.goto(`${BASE}/?shot=${shot.name}`, { waitUntil: "load", timeout: 30000 });
+    let ready = false;
     try {
-      ready = await evaluate('window.__shot && window.__shot.ready === true');
-    } catch { ready = false; }
-    if (ready || !expectReady) break;
-    await sleep(500);
+      await page.waitForFunction(() => window.__shotReady === true, { timeout: 30000 });
+      ready = true;
+    } catch {
+      ready = false;
+    }
+    const shotErrors = await page.evaluate(() => window.__shotErrors || 0).catch(() => -1);
+    await page.waitForTimeout(700); // let the camera and the scene settle
+    await page.screenshot({ path: shot.file, type: "jpeg", quality: 85 });
+    const bytes = statSync(shot.file).size;
+    results.push({ ...shot, ready, errors: shotErrors, consoleErrors: errors.length, bytes });
+    console.log(JSON.stringify(results[results.length - 1]));
+    await page.close();
   }
-  if (expectReady && !ready) throw new Error('timed out waiting for window.__shot.ready');
-  if (!expectReady) await sleep(waitMs);
-
-  const errors = (await evaluate('window.__shotErrors || 0')) ?? 0;
-  const shot = await send('Page.captureScreenshot', { format: 'jpeg', quality: 82 });
-  const buf = Buffer.from(shot.data, 'base64');
-  mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(out, buf);
-  console.log(JSON.stringify({ ready: !!ready, errors, out, bytes: buf.length }));
-  if (errors > 0) code = 1;
-} catch (err) {
-  console.error('shot failed:', err.message);
-  code = 1;
+  await browser.close();
 } finally {
-  try { ws?.close(); } catch { /* ignore */ }
-  chrome.kill('SIGKILL');
+  server.kill();
 }
-process.exit(code);
+
+const bad = results.filter((r) => !r.ready || r.errors !== 0 || r.bytes > 262144);
+console.log(`\nshots: ${results.length - bad.length}/${results.length} clean`);
+if (bad.length) {
+  console.log("problems:", JSON.stringify(bad));
+  process.exit(1);
+}
