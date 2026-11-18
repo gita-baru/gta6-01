@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- Solmar Heat (v2, 18 Nov 2026): page, import map, HUD markup. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solmar Heat — an open-world crime game</title>
+<link rel="stylesheet" href="./style.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<canvas id="game" aria-label="Solmar Heat: an open-world crime game in Solmar City"></canvas>
+<div id="hud">
+  <div id="top-left">
+    <div id="objective"></div>
+    <div id="objective-dist"></div>
+  </div>
+  <div id="top-right">
+    <div id="cash">$0</div>
+    <div id="stars">☆☆☆☆☆</div>
+    <div id="health"><div id="health-fill"></div></div>
+    <div id="clock">13:30</div>
+  </div>
+  <canvas id="minimap" width="190" height="190"></canvas>
+  <div id="bottom-right">
+    <div id="speed"></div>
+    <div id="ammo"></div>
+  </div>
+  <div id="controls-hint">WASD move/drive · E enter car · F punch · Click shoot · Shift run · Space brake · T job · M mute · Esc pause</div>
+</div>
+<div id="banner" class="hidden"><div id="banner-title"></div><div id="banner-text"></div></div>
+<div id="toast" class="hidden"></div>
+<div id="menu" class="hidden">
+  <div id="menu-card">
+    <h1 id="menu-title"></h1>
+    <p id="menu-sub"></p>
+    <p id="menu-extra"></p>
+    <div id="menu-buttons"></div>
+  </div>
+</div>
+<p id="status" role="status" aria-live="polite"></p>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
